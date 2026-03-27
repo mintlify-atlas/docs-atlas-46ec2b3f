@@ -1,0 +1,180 @@
+---
+title: BALROG
+description: Evaluate game-playing agents across four NetHack-family environments using the BALROG benchmark.
+---
+
+The BALROG domain group evaluates an agent's ability to play text-based and grid-world games. It wraps four distinct environments — `babyai`, `babaisai`, `minihack`, and `nle` — each selectable as a separate domain variant.
+
+## What It Evaluates
+
+BALROG tests sequential decision-making in partially observable environments. The agent receives a textual description of the game state each step and must produce a valid action. The primary metric is **`average_progress`** — the mean episode completion fraction across all tasks in the environment, expressed as a percentage.
+
+Each environment runs multiple episodes per task. Results are aggregated into a `report.json` with per-task and per-environment breakdowns.
+
+## The Four Environments
+
+<Tabs>
+  <Tab title="babyai">
+    **BabyAI** is a grid-world environment with language-conditioned navigation and manipulation tasks. The default task set includes 5 tasks from `BabyAI-MixedTrainLocal-v0`:
+
+    - `goto` — navigate to a target object
+    - `pickup` — pick up a specified object
+    - `open` — open a door
+    - `putnext` — place an object next to another
+    - `pick_up_seq_go_to` — pick up an object then navigate
+
+    Default episodes per task: **10**. Staged eval fraction: 1/10.
+  </Tab>
+  <Tab title="babaisai">
+    **Baba Is AI** is a rule-manipulation puzzle game. The agent must understand and modify game rules (e.g., "BABA IS YOU", "FLAG IS WIN") to reach the win condition. The default task set includes 38 puzzle configurations across single-room and two-room scenarios.
+
+    Default episodes per task: **3**.
+  </Tab>
+  <Tab title="minihack">
+    **MiniHack** provides a suite of NetHack-based custom environments. The default task set includes 8 tasks:
+
+    - `MiniHack-Boxoban-Hard-v0`
+    - `MiniHack-Boxoban-Medium-v0`
+    - `MiniHack-MazeWalk-9x9-v0`
+    - `MiniHack-MazeWalk-15x15-v0`
+    - `MiniHack-Corridor-R3-v0`
+    - `MiniHack-CorridorBattle-Dark-v0`
+    - `MiniHack-Quest-Easy-v0`
+    - `MiniHack-Quest-Medium-v0`
+
+    Default episodes per task: **5**. Staged eval fraction: 1/5.
+  </Tab>
+  <Tab title="nle">
+    **NLE** (NetHack Learning Environment) runs the full `NetHackChallenge-v0` game. This is the most complex environment, with a large action space, procedurally generated dungeons, and rich item/monster interactions.
+
+    Default episodes: **5**. Max episode steps: 100,000. No-progress timeout: 150 steps.
+  </Tab>
+</Tabs>
+
+## Hydra Configuration
+
+BALROG uses [Hydra](https://hydra.cc/) for configuration. The config file is at `domains/balrog/config/config.yaml`.
+
+Key configuration sections:
+
+```yaml
+eval:
+  output_dir: "results"
+  num_workers: 16
+  num_episodes:
+    nle: 5
+    minihack: 5
+    babyai: 10
+    babaisai: 3
+  save_trajectories: True
+  feedback_on_invalid_action: True
+
+envs:
+  names: babyai  # environment to evaluate
+
+tasks:
+  babyai_tasks:
+    - "BabyAI-MixedTrainLocal-v0/goto"
+    # ...
+```
+
+The harness composes this config and overrides it via command-line arguments:
+
+```python
+cfg = compose(
+    config_name="config",
+    overrides=[
+        f"eval.output_dir={args.output_dir}",
+        f"eval.num_workers={args.num_workers}",
+        f"envs.names={env_name}",
+    ]
+)
+```
+
+## Setup
+
+<Steps>
+  <Step title="Run the post-install script">
+    BALROG requires additional game data (Boxoban levels and TextWorld games) that must be downloaded after installing the Python packages:
+
+    ```bash
+    python -m domains.balrog.scripts.post_install
+    ```
+
+    This downloads:
+    - **Boxoban levels** from the DeepMind repository into the MiniHack data directory
+    - **TextWorld game files** (`tw-games.zip`) into `./domains/balrog/`
+
+    <Warning>
+      This script must be run before evaluating any BALROG environment. Missing game data will cause environment initialization to fail silently or crash.
+    </Warning>
+  </Step>
+  <Step title="Run evaluation">
+    Select the sub-environment with `--domain`:
+
+    ```bash
+    # BabyAI
+    python -m domains.harness \
+      --domain balrog_babyai \
+      --run_id initial_balrog_babyai_0 \
+      --num_samples 1
+
+    # BabaIsAI
+    python -m domains.harness \
+      --domain balrog_babaisai \
+      --run_id initial_balrog_babaisai_0
+
+    # MiniHack
+    python -m domains.harness \
+      --domain balrog_minihack \
+      --run_id initial_balrog_minihack_0
+
+    # NLE
+    python -m domains.harness \
+      --domain balrog_nle \
+      --run_id initial_balrog_nle_0
+    ```
+  </Step>
+  <Step title="Generate the report">
+    ```bash
+    python -m domains.report --domain balrog_babyai \
+      --dname ./outputs/initial_balrog_babyai_0
+    ```
+
+    The report prints a summary table of `average_progress` per environment and writes `report.json` to the output directory.
+  </Step>
+</Steps>
+
+## Output Structure
+
+Each episode produces a JSON file and optionally a text trajectory. Results are organized under `<output_dir>/<env_name>/<task_name>/`.
+
+The `report.json` summary contains:
+
+```json
+{
+  "average_progress": 12.5,
+  "standard_error": 2.1,
+  "environments": {
+    "babyai": {
+      "progression_percentage": 12.5,
+      "standard_error": 2.1,
+      "episodes_played": 50
+    }
+  }
+}
+```
+
+## Domain Properties
+
+| Property | Value |
+|---|---|
+| Score key | `average_progress` |
+| Splits | `train` only |
+| Eval subset | full dataset |
+| Ensemble supported | No |
+| Staged eval samples | 1 (all variants) |
+
+<Tip>
+  BALROG does not support `--resume_from`. Each run starts fresh. Use `--num_samples` to limit the number of episodes during development.
+</Tip>

@@ -1,0 +1,272 @@
+---
+title: Domain Utilities
+description: Helper functions for querying domain-specific evaluation configuration — splits, score keys, subset names, and staged evaluation parameters.
+---
+
+## Overview
+
+`utils/domain_utils.py` centralises all domain-specific configuration so the rest of the codebase can query it without duplicating `if/elif` chains.
+
+Supported domain families:
+
+- **Human preferences** — `search_arena`, `paper_review`, `imo_grading`
+- **Balrog games** — any domain containing `"balrog"` (e.g. `"balrog_babyai"`, `"balrog_minihack"`)
+- **Genesis robotics** — any domain containing `"genesis"`
+- **Polyglot coding** — any domain containing `"polyglot"`
+- **IMO proof** — `imo_proof`
+
+---
+
+## `get_domain_eval_subset`
+
+Returns the dataset subset suffix used when locating training-split evaluation results.
+
+```python
+from utils.domain_utils import get_domain_eval_subset
+
+subset = get_domain_eval_subset("search_arena")  # "_filtered_100_train"
+subset = get_domain_eval_subset("balrog_babyai")  # ""
+```
+
+### Signature
+
+```python
+def get_domain_eval_subset(domain: str) -> str
+```
+
+### Parameters
+
+<ParamField path="domain" type="str" required>
+  Domain name string.
+</ParamField>
+
+### Return Value
+
+<ResponseField name="subset" type="str">
+  The dataset suffix appended to the domain name when building the path to the initial evaluation output directory.
+
+  | Domain | Return value |
+  |---|---|
+  | `search_arena`, `paper_review` | `"_filtered_100_train"` |
+  | `imo_grading` | `"_filtered_100_train"` |
+  | Balrog / Genesis / Polyglot / `imo_proof` | `""` (empty string) |
+</ResponseField>
+
+### Example
+
+```python
+domain = "paper_review"
+subset = get_domain_eval_subset(domain)
+eval_path = f"./outputs/initial_{domain}{subset}_0/"
+# ./outputs/initial_paper_review_filtered_100_train_0/
+```
+
+---
+
+## `get_domain_splits`
+
+Returns the list of evaluation splits for a given domain.
+
+```python
+from utils.domain_utils import get_domain_splits
+
+get_domain_splits("search_arena")              # ["train", "val"]
+get_domain_splits("search_arena", eval_test=True)  # ["train", "val", "test"]
+get_domain_splits("balrog_babyai")             # ["train"]
+```
+
+### Signature
+
+```python
+def get_domain_splits(domain: str, eval_test: bool = False) -> list[str]
+```
+
+### Parameters
+
+<ParamField path="domain" type="str" required>
+  Domain name string.
+</ParamField>
+
+<ParamField path="eval_test" type="bool" default="false">
+  When `True`, appends `"test"` to the split list for domains that support a test split (currently `search_arena`, `paper_review`, and `imo_grading`).
+</ParamField>
+
+### Return Value
+
+<ResponseField name="splits" type="list[str]">
+  Ordered list of split names.
+
+  | Domain | Default splits | With `eval_test=True` |
+  |---|---|---|
+  | `search_arena`, `paper_review`, `imo_grading` | `["train", "val"]` | `["train", "val", "test"]` |
+  | Balrog / Genesis / Polyglot / `imo_proof` | `["train"]` | `["train"]` |
+</ResponseField>
+
+---
+
+## `get_domain_score_key`
+
+Returns the JSON key used to read the primary score from a domain's `report.json`.
+
+```python
+from utils.domain_utils import get_domain_score_key
+
+key = get_domain_score_key("search_arena")   # "overall_accuracy"
+key = get_domain_score_key("balrog_babyai")  # "average_progress"
+key = get_domain_score_key("genesis_walk")   # "average_fitness"
+```
+
+### Signature
+
+```python
+def get_domain_score_key(domain: str) -> str
+```
+
+### Parameters
+
+<ParamField path="domain" type="str" required>
+  Domain name string.
+</ParamField>
+
+### Return Value
+
+<ResponseField name="key" type="str">
+  The top-level key in `report.json` that holds the primary scalar score.
+
+  | Domain | Key |
+  |---|---|
+  | `search_arena`, `paper_review`, `imo_grading` | `"overall_accuracy"` |
+  | Balrog domains | `"average_progress"` |
+  | Genesis domains | `"average_fitness"` |
+  | Polyglot domains | `"accuracy_score"` |
+  | `imo_proof` | `"points_percentage"` |
+</ResponseField>
+
+---
+
+## `can_domain_ensembled`
+
+Returns whether the domain supports ensemble evaluation.
+
+```python
+from utils.domain_utils import can_domain_ensembled
+
+can_domain_ensembled("search_arena")  # True
+can_domain_ensembled("balrog_babyai") # False
+```
+
+### Signature
+
+```python
+def can_domain_ensembled(domain: str) -> bool
+```
+
+### Parameters
+
+<ParamField path="domain" type="str" required>
+  Domain name string.
+</ParamField>
+
+### Return Value
+
+<ResponseField name="result" type="bool">
+  `True` if an ensemble of agent outputs can be evaluated; `False` otherwise.
+
+  | Domain | Supports ensemble |
+  |---|---|
+  | `search_arena`, `paper_review` | `True` |
+  | `imo_grading` | `True` |
+  | Balrog / Genesis / Polyglot / `imo_proof` | `False` |
+</ResponseField>
+
+---
+
+## `get_domain_stagedeval_samples`
+
+Returns the number of samples used during staged (fast) evaluation.
+
+```python
+from utils.domain_utils import get_domain_stagedeval_samples
+
+samples = get_domain_stagedeval_samples("search_arena")  # 10
+samples = get_domain_stagedeval_samples("balrog_babyai") # 1
+```
+
+### Signature
+
+```python
+def get_domain_stagedeval_samples(domain: str) -> int
+```
+
+### Parameters
+
+<ParamField path="domain" type="str" required>
+  Domain name string.
+</ParamField>
+
+### Return Value
+
+<ResponseField name="samples" type="int">
+  Number of evaluation samples in a staged (partial) evaluation run.
+
+  | Domain | Staged samples |
+  |---|---|
+  | `search_arena`, `paper_review` | `10` |
+  | Balrog domains | `1` |
+  | Genesis domains | `3` |
+  | Polyglot domains | `10` |
+  | `imo_grading`, `imo_proof` | `10` |
+</ResponseField>
+
+---
+
+## `get_domain_stagedeval_frac`
+
+Returns the fraction of full-evaluation samples covered by a staged evaluation. Used to normalise staged scores so they are comparable to full-eval scores.
+
+```python
+from utils.domain_utils import get_domain_stagedeval_frac
+
+frac = get_domain_stagedeval_frac("search_arena")  # 0.1  (10/100)
+frac = get_domain_stagedeval_frac("balrog_babyai") # 0.1  (1/10)
+```
+
+### Signature
+
+```python
+def get_domain_stagedeval_frac(domain: str) -> float
+```
+
+### Parameters
+
+<ParamField path="domain" type="str" required>
+  Domain name string.
+</ParamField>
+
+### Return Value
+
+<ResponseField name="frac" type="float">
+  `staged_samples / full_eval_samples`. Scores from a staged run are multiplied by this value in `get_saved_score` to produce a full-eval-comparable number.
+
+  | Domain | Fraction | Calculation |
+  |---|---|---|
+  | `search_arena`, `paper_review` | `0.10` | `10 / 100` |
+  | `balrog_babyai` | `0.10` | `1 / 10` |
+  | `balrog_minihack` | `0.20` | `1 / 5` |
+  | Genesis domains | `0.50` | `3 / 6` |
+  | Polyglot domains | `0.167` | `10 / 60` |
+  | `imo_grading` | `0.10` | `10 / 100` |
+  | `imo_proof` | `0.167` | `10 / 60` |
+</ResponseField>
+
+### Example
+
+```python
+from utils.domain_utils import get_domain_stagedeval_frac
+from utils.gl_utils import get_score
+
+domain = "search_arena"
+raw_score = get_score(domain, "/runs/exp1", genid=0, split="train")
+frac = get_domain_stagedeval_frac(domain)
+comparable_score = raw_score * frac  # scale to full-eval range
+```

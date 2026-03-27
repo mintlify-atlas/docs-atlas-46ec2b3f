@@ -1,0 +1,198 @@
+---
+title: "Output Directory Structure"
+description: "Reference for the file and directory layout produced by a HyperAgents generate_loop run, including per-generation artifacts, evaluation outputs, and the run-level archive."
+---
+
+Every run of `generate_loop.py` creates a timestamped directory under `outputs/`. Everything the loop writes—agent diffs, evaluation results, metadata, and analysis plots—lives inside that single directory tree.
+
+## Top-level layout
+
+```text
+outputs/
+└── generate_<run_id>/          # e.g. generate_20251216_192315_534288
+    ├── gen_initial/            # baseline snapshot before any self-improvement
+    ├── gen_0/                  # generation 0 (only present when transfer patches are supplied)
+    ├── gen_1/                  # first self-improved generation
+    ├── gen_2/
+    │   └── ...
+    ├── archive.jsonl           # append-only log of the archive after every generation
+    ├── generate_loop.log       # arguments used to launch this run
+    └── select_next_parent.log  # log for the parent-selection container (if edit_select_parent=True)
+```
+
+The `run_id` is a UTC timestamp with microseconds (`%Y%m%d_%H%M%S_%f`), so directory names are both unique and sortable by start time.
+
+## Generation directories
+
+Each generation gets its own subdirectory. The special `gen_initial/` directory contains the original (unmodified) evaluation baseline. Subsequent directories are named `gen_0/`, `gen_1/`, `gen_2/`, etc.
+
+```text
+gen_<N>/
+├── metadata.json               # bookkeeping record for this generation
+├── agent_output/               # outputs from the meta-agent (omitted for gen_initial)
+│   ├── model_patch.diff        # git diff produced by the meta-agent
+│   └── meta_agent_chat_history.md   # full conversation log
+├── <domain>_eval/              # training-split evaluation results
+│   ├── predictions.csv         # per-sample predictions from the task agent
+│   ├── report.json             # aggregated evaluation scores
+│   └── agent_evals/            # per-sample chat history files
+├── <domain>_eval_val/          # validation-split evaluation (when available)
+│   └── ...                     # same structure as _eval/
+├── <domain>_eval_test/         # test-split evaluation (when --eval_test is set)
+│   └── ...
+├── report_ensemble_<domain>_train.json   # ensemble score on training split
+├── report_ensemble_<domain>_val.json     # ensemble score on validation split
+└── generate.log                # per-generation docker execution log
+```
+
+For multi-domain runs each `<domain>_eval/` subtree is replicated per domain (e.g. `paper_review_eval/`, `genesis_go2walking_eval/`).
+
+## File reference
+
+### `metadata.json`
+
+Written at the end of every `generate()` call. Contains all bookkeeping needed to resume, replay, or analyse a run.
+
+<Accordion title="All metadata.json fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `gen_output_dir` | `string` | Absolute path to this generation's output directory on the host. |
+| `current_genid` | `int \| "initial"` | Identifier for this generation. `"initial"` for the baseline snapshot; integers starting from `0` or `1` for evolved generations. |
+| `parent_genid` | `int \| "initial" \| null` | The `current_genid` of the parent node that was selected as the starting point for this generation's meta-agent run. `null` for `gen_0` when bootstrapped from external patches. |
+| `run_baseline` | `string \| null` | Baseline mode string passed to the run (e.g. `"dgm"`, `"no_selfimprove"`). `null` for a standard HyperAgents run. |
+| `prev_patch_files` | `list[string]` | Ordered list of `.diff` file paths that were applied to the container *before* running the meta-agent. These come from the parent's lineage. |
+| `curr_patch_files` | `list[string]` | List containing the single `model_patch.diff` file produced by this generation's meta-agent (empty if the agent produced no diff). |
+| `parent_agent_success` | `bool` | `true` if the meta-agent container exited with code 0. Set to `true` without running the agent when `run_meta_agent=False`. |
+| `run_eval` | `bool` | `true` if evaluation was actually executed for this generation. `false` if the meta-agent produced no diff or an exception occurred. |
+| `run_full_eval` | `bool` | `true` if the full (non-staged) evaluation completed. For staged evaluation, only the subset threshold was evaluated; the full set is only run if the staged score is above zero. |
+| `valid_parent` | `bool` | `true` if this generation has a valid evaluation score and can be selected as a parent for future generations. Computed as `run_eval AND (eval_successful OR bootstrapped_from_patches)`. |
+| `optimize_option` | `string` | Which component the meta-agent was asked to improve: `"only_agent"`, `"only_ensemble"`, or `"both_agent_ensemble"`. |
+| `agent_archive_path` | `string \| null` | Path to the external agent archive used when `optimize_option="only_ensemble"`. |
+| `can_select_next_parent` | `bool` | `true` if this node is eligible to run the parent-selection container. Set to `false` if `select_next_parent_container` fails on this node. |
+
+</Accordion>
+
+<Note>
+`valid_parent` is the flag checked by `select_parent` and `visualize_archive`. A generation with `valid_parent: false` will never be chosen as the parent of a future generation and is shown with a red border in archive visualizations.
+</Note>
+
+### `agent_output/model_patch.diff`
+
+A standard unified git diff (`git diff` format) produced by the meta-agent. The diff is applied with `patch -p1` inside a fresh Docker container at the start of each subsequent generation to reconstruct the agent's code state. Entries that touch `domains/` are automatically filtered out before application.
+
+The file is absent or empty for `gen_initial/` and for any generation where the meta-agent failed or produced no changes.
+
+### `agent_output/meta_agent_chat_history.md`
+
+The complete multi-turn conversation between the meta-agent and the underlying foundation model, saved as Markdown. Each turn is a labelled section with the role (`User` / `Assistant`) and message content, including any tool calls and their results. This file is the primary artifact for understanding *why* the agent made the code changes it did.
+
+### `<domain>_eval/predictions.csv`
+
+A CSV file with one row per evaluated task instance. Columns vary by domain but always include:
+
+- A question/task ID column (domain-specific)
+- A `prediction` column with the task agent's answer
+- A ground-truth column (domain-specific key)
+
+Rows with an empty `prediction` are filtered out during scoring.
+
+### `<domain>_eval/report.json`
+
+The aggregated evaluation report produced by `domains/report.py`. Common fields across all domains:
+
+<Accordion title="report.json fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `overall_accuracy` | `float` | Fraction of predictions that exactly match the ground truth. This is the primary score key for most domains. |
+| `total_correct` | `int` | Absolute count of correct predictions. |
+| `total` | `int` | Total number of evaluated instances. |
+| `accuracy_by_ground_truth` | `dict` | Per-label breakdown, each entry containing `precision`, `recall`, `correct`, and `total`. |
+| `label_distribution` | `dict` | Sub-keys `ground_truth` and `prediction`, each mapping labels to their relative frequency. |
+| `random_guess_accuracy` | `float` | Expected accuracy of a random classifier given the ground-truth label distribution. |
+| `question_ids_failed` | `list` | IDs of instances the agent answered incorrectly. |
+| `question_ids_passed` | `list` | IDs of instances the agent answered correctly. |
+| `normalized_mean_absolute_error` | `float` | Present only for `imo_grading`; MAE normalized to [0, 1] over the point scale. |
+
+</Accordion>
+
+The exact key used as the scalar "score" by `get_score()` is domain-specific and defined by `get_domain_score_key()` in `utils/domain_utils.py`. For accuracy-based domains this is `"overall_accuracy"`.
+
+### `<domain>_eval/agent_evals/`
+
+A directory containing one Markdown file per evaluated task instance, recording the full conversation log of the *task agent* as it worked through that instance. File names are keyed by the task/question ID. These are useful for debugging individual failures.
+
+## Run-root files
+
+### `archive.jsonl`
+
+An append-only JSONL file. A new line is appended after every generation completes. Each line is a JSON object with two keys:
+
+```json
+{
+  "current_genid": 3,
+  "archive": ["initial", 1, 2, 3]
+}
+```
+
+| Key | Description |
+|---|---|
+| `current_genid` | The generation ID that was just added to the archive. |
+| `archive` | The complete ordered list of all generation IDs in the archive at this point in time, starting from `"initial"`. |
+
+Reading the last line gives the current state of the archive. Reading all lines gives a time-series view of how the archive grew. The helper `load_archive_data(filepath, last_only=True)` in `utils/gl_utils.py` handles both modes.
+
+<Tip>
+Because `archive.jsonl` is append-only, it is safe to read while a run is in progress. Parse it with `load_archive_data` rather than `json.load`—the file is newline-delimited, not a single JSON document.
+</Tip>
+
+### `generate_loop.log`
+
+A plain-text file with one line per invocation of `generate_loop()`, recording all arguments passed to the function:
+
+```text
+Args: domains=['paper_review', 'genesis_go2walking'], run_id=None, max_generation=10, ...
+```
+
+For resumed runs, a new line is appended rather than overwriting the previous entry.
+
+## Complete example tree
+
+```text
+outputs/generate_20251216_192315_534288/
+├── archive.jsonl
+├── generate_loop.log
+├── gen_initial/
+│   ├── metadata.json
+│   ├── HyperAgents/               # snapshot of the repo at run start
+│   ├── paper_review_eval/
+│   │   ├── predictions.csv
+│   │   ├── report.json
+│   │   └── agent_evals/
+│   └── genesis_go2walking_eval/
+│       ├── predictions.csv
+│       ├── report.json
+│       └── agent_evals/
+├── gen_1/
+│   ├── metadata.json
+│   ├── agent_output/
+│   │   ├── model_patch.diff
+│   │   └── meta_agent_chat_history.md
+│   ├── paper_review_eval/
+│   │   ├── predictions.csv
+│   │   ├── report.json
+│   │   └── agent_evals/
+│   └── genesis_go2walking_eval/
+│       ├── predictions.csv
+│       ├── report.json
+│       └── agent_evals/
+├── gen_2/
+│   └── ...
+├── progress_plot_paper_review_train_agent.png
+├── progress_info_paper_review_train_agent.txt
+├── archive_graph_paper_review_train_agent.png
+└── ...
+```
+
+Progress plots and archive graphs (generated automatically after each generation) are written directly to the run root.

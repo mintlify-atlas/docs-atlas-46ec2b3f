@@ -1,0 +1,304 @@
+---
+title: "Analysis & Visualization"
+description: "Reference for HyperAgents' plotting utilities: progress curves, archive tree visualizations, multi-run comparison plots, and how to run them manually after a completed experiment."
+---
+
+The `analysis/` directory contains all plotting and statistical-testing scripts. Plots are also generated automatically at the end of every generation during a live run.
+
+## Analysis directory contents
+
+| File | Purpose |
+|---|---|
+| `plot_progress.py` | Line plots of score vs. iteration for a single run. |
+| `visualize_archive.py` | Directed-graph visualization of the full archive tree. |
+| `plot_comparison.py` | Multi-run comparison curves with bootstrap confidence intervals. |
+| `plot_testevals.py` | Bar charts of best-found agent test scores across methods. |
+| `analysis_utils.py` | Shared bootstrap CI and significance-testing helpers. |
+| `transfer_utils.py` | Utilities for selecting nodes to transfer across experiments. |
+
+---
+
+## Parameters common to all plotting functions
+
+### `split`
+
+Which evaluation split's scores to use:
+
+| Value | Source directory |
+|---|---|
+| `"train"` | `gen_{N}/{domain}_eval/` |
+| `"val"` | `gen_{N}/{domain}_eval_val/` |
+| `"test"` | `gen_{N}/{domain}_eval_test/` |
+
+A split is only available if evaluation was run for it. For most domains only `"train"` is produced by default; `"val"` is added when the domain definition includes a validation subset.
+
+### `type`
+
+Which score value to use when plotting:
+
+| Value | Behaviour |
+|---|---|
+| `"agent"` | Use the task-agent score from `report.json`. |
+| `"ensemble"` | Use the ensemble score from `report_ensemble_{domain}_{split}.json`. |
+| `"max"` | Use `max(agent_score, ensemble_score)`. Falls back to whichever is available. |
+
+When a domain does not support ensembling, only `"agent"` is meaningful.
+
+---
+
+## Progress plots
+
+`plot_progress.py` produces line plots showing score progression over the ordered sequence of archive additions.
+
+### `plot_progress_single`
+
+```python
+from analysis.plot_progress import plot_progress_single
+
+plot_progress_single(
+    domain,      # e.g. "paper_review"
+    exp_dir,     # path to the generate_<run_id>/ directory
+    split="train",
+    type="agent",
+    color="blue",  # "blue", "green", or "orange"
+    svg=False,     # also save an SVG copy
+)
+```
+
+**What it produces:**
+
+- `progress_plot_{domain}_{split}_{type}.png` — line chart saved to `exp_dir/`
+- `progress_info_{domain}_{split}_{type}.txt` — companion text file with iteration counts, best scores per iteration, and the patch-file lineage of the best agent
+
+**What the plot shows:**
+
+Three series are drawn on the same axes:
+
+1. **Best Agent** — the running maximum score across all archive members seen so far.
+2. **Average of Archive** — the running mean of all non-`None` scores seen so far.
+3. **Lineage to Final Best Agent** — the score at each node on the path from `gen_initial` to the best-scoring generation, connected as a line. This highlights the evolutionary path that produced the best result.
+
+The x-axis counts iterations (one per archive entry); the y-axis is the raw score value.
+
+### `plot_progress_together`
+
+```python
+from analysis.plot_progress import plot_progress_together
+
+plot_progress_together(
+    domains,     # list of domain strings, e.g. ["paper_review", "genesis_go2walking"]
+    exp_dir,
+    split="train",
+    type="agent",
+    color="blue",
+    svg=False,
+)
+```
+
+Aggregates scores across multiple domains before plotting. For each node, the aggregated score is the mean of per-domain scores. If any domain returns `None` for a node (not compilable or not evaluated), that node's aggregated score is also `None` and it is excluded from the running average.
+
+**Output files:**
+- `progress_plot_together_{domA}_{domB}_..._{split}_{type}.png`
+- `progress_info_together_{domA}_{domB}_..._{split}_{type}.txt`
+
+### Running from the command line
+
+```bash
+# Single domain
+python -m analysis.plot_progress \
+  --domains paper_review \
+  --path outputs/generate_20251216_192315_534288 \
+  --color blue
+
+# Multiple domains (aggregated together)
+python -m analysis.plot_progress \
+  --domains paper_review genesis_go2walking \
+  --path outputs/generate_20251216_192315_534288 \
+  --color green
+
+# Also check ensemble types and save SVG
+python -m analysis.plot_progress \
+  --domains paper_review \
+  --path outputs/generate_20251216_192315_534288 \
+  --check_ensemble \
+  --svg
+```
+
+When `--check_ensemble` is set and the domain supports ensembling, plots are generated for all three score types (`agent`, `ensemble`, `max`).
+
+---
+
+## Archive tree visualization
+
+`visualize_archive.py` renders the full archive as a directed acyclic graph (DAG) where nodes are generation IDs and edges point from parent to child.
+
+### `visualize_archive_single`
+
+```python
+from analysis.visualize_archive import visualize_archive_single
+
+visualize_archive_single(
+    domain,
+    exp_dir,
+    trunc_its=-1,    # -1 = no truncation; positive int limits nodes shown
+    split="train",
+    type="agent",
+    plot_borders=False,  # color node borders by valid_parent status
+    save_svg=False,
+)
+```
+
+**Output:** `archive_graph_{domain}_{split}_{type}.png` in `exp_dir/`
+
+**What the graph shows:**
+
+- Each **node** represents one generation. The node labelled `#0` corresponds to `gen_initial` (the initial node is relabelled `"0"` in the graph for visual consistency).
+- **Node color** encodes score via an orange → yellow → green colormap. Scores are normalized to [min, max] across all valid nodes in the graph.
+- Nodes with `score = None` (non-compilable or evaluation failed) are colored at the low end of the colormap and labelled `N/A`.
+- The **best-scoring node** is drawn as a diamond (◆); all others are circles.
+- **Edges** run from parent to child (arrows are not drawn; the top-down layout from `graphviz dot` makes direction clear).
+- Node labels show `#{genid}` on the first line and the formatted score (e.g. `0.432`) on the second line.
+- When `plot_borders=True`, node borders are **green** if `valid_parent=true` and **red** if `valid_parent=false`.
+
+### `visualize_archive_together`
+
+```python
+from analysis.visualize_archive import visualize_archive_together
+
+visualize_archive_together(
+    domains,     # list of domain strings
+    exp_dir,
+    trunc_its=-1,
+    split="train",
+    type="agent",
+    plot_borders=False,
+    save_svg=False,
+)
+```
+
+Produces a single graph where each node's color reflects the **mean score across all domains**. If any domain has `None` for a node, that node is treated as invalid (shown in gray/low-color end). The colorbar label reads `"Score (aggregated)"`.
+
+**Output:** `archive_graph_together_{domA}_{domB}_..._{split}_{type}.png`
+
+### Running from the command line
+
+```bash
+# Single domain
+python -m analysis.visualize_archive \
+  --domains paper_review \
+  --path outputs/generate_20251216_192315_534288
+
+# Multiple domains, aggregated
+python -m analysis.visualize_archive \
+  --domains paper_review genesis_go2walking \
+  --path outputs/generate_20251216_192315_534288 \
+  --together
+
+# Show valid_parent borders, limit to first 50 nodes, save SVG
+python -m analysis.visualize_archive \
+  --domains paper_review \
+  --path outputs/generate_20251216_192315_534288 \
+  --plot_borders \
+  --trunc_its 50 \
+  --svg
+```
+
+<Note>
+`visualize_archive.py` requires `graphviz` and the Python `pygraphviz` package. Install the system package (`graphviz graphviz-devel`) before installing `pygraphviz` via pip. The `dot` layout program must be on `PATH`.
+</Note>
+
+---
+
+## Automatic plot generation during a run
+
+`generate_loop.py` calls both `plot_progress_single` / `plot_progress_together` and `visualize_archive_single` / `visualize_archive_together` automatically at the end of every generation (lines 968–1004 of `generate_loop.py`).
+
+The score types generated depend on the run configuration:
+
+| Condition | Score types plotted |
+|---|---|
+| `optimize_option="only_ensemble"` | `["ensemble"]` |
+| Ensemble evaluation is enabled | `["agent", "ensemble", "max"]` |
+| Default (agent only) | `["agent"]` |
+
+Combined `_together` plots are only generated when the run targets more than one domain and all domains share at least one common split.
+
+All plots are saved directly to the run-root directory (`outputs/generate_{run_id}/`), so they accumulate alongside the `archive.jsonl` and can be inspected while the run is still in progress.
+
+---
+
+## Multi-run comparison plots
+
+`plot_comparison.py` is used for comparing multiple methods across multiple runs. It is configured by editing the `domains_paths_data` list at the top of the file's `main()` function.
+
+```bash
+python -m analysis.plot_comparison
+```
+
+**What it produces** (all saved to `analysis/outputs/`):
+
+- `comparison_{plotlabel}_{domain1}+{domain2}+....png` — cumulative-max score curves with 95% bootstrap confidence intervals, one curve per method. For a single domain the filename is `comparison_{plotlabel}_{domain}.png`.
+- `analysis/outputs/pdfs/comparison_{plotlabel}_{domain1}+{domain2}+....pdf` / `.svg` — publication-quality transparent versions.
+- `significance_{plotlabel}_{domain1}+{domain2}+....txt` — pairwise statistical significance tests (Wilcoxon signed-rank or Mann-Whitney U, depending on sample sizes). For a single domain the filename is `significance_{plotlabel}_{domain}.txt`.
+
+Each method entry in `domains_paths_data` maps to a list of run directories. The script interpolates each run's cumulative-max scores onto a shared x-grid and then computes the median and bootstrap CIs across runs.
+
+---
+
+## Statistical testing utilities
+
+`analysis/analysis_utils.py` provides two functions used by both `plot_comparison.py` and `plot_testevals.py`.
+
+### `compute_bootstrap_ci`
+
+```python
+from analysis.analysis_utils import compute_bootstrap_ci
+
+median, lower_ci, upper_ci = compute_bootstrap_ci(
+    data,              # 1D array of scalar scores
+    n_bootstrap=1000,
+    ci_level=0.95,
+    random_seed=42,
+)
+```
+
+Returns the median and 95% bootstrap confidence interval for a set of scores. When `data` has only one element, the CI collapses to the single value.
+
+### `save_significance_tests`
+
+```python
+from analysis.analysis_utils import save_significance_tests
+
+save_significance_tests(
+    methods_data,     # dict: method_name -> np.ndarray of scores
+    output_file,      # path to write results
+    metadata=None,    # optional dict of metadata to include in the header
+    use_bootstrap=False,
+)
+```
+
+Performs all pairwise one-sided comparisons (H₁: method A > method B). With `use_bootstrap=True` uses Wilcoxon signed-rank (paired) or Mann-Whitney U (unpaired). With `use_bootstrap=False` uses paired or independent t-tests. Significance stars (`*`, `**`, `***`) are added for p < 0.05, 0.01, 0.001.
+
+---
+
+## Transfer analysis
+
+`analysis/transfer_utils.py` helps identify which node from a completed run is the best candidate for zero-shot transfer to a new run.
+
+```bash
+python -m analysis.transfer_utils \
+  --domains paper_review genesis_go2walking \
+  --path outputs/generate_20251216_192315_534288 \
+  --top_n 3 \
+  --get_commands
+```
+
+Three selection strategies are supported via `choose_node_for_transfer`:
+
+| Method | Selects |
+|---|---|
+| `max_score` | Top-N nodes by absolute score. |
+| `growth` | Top-N nodes by discounted descendant-improvement score (descendants scored relative to the root). |
+| `growth_imd` | Same as `growth`, but each descendant's delta is computed relative to its immediate parent rather than the root. |
+
+The `--get_commands` flag prints the `python -m domains.run_eval` commands needed to evaluate the selected nodes on a held-out test domain, useful for transfer experiments.

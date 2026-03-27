@@ -1,0 +1,350 @@
+---
+title: Generate Loop Utilities
+description: Core utilities for the evolutionary generate loop — archive management, parent selection, scoring, and container patch application.
+---
+
+## Overview
+
+`utils/gl_utils.py` contains the helper functions that power the HyperAgents evolutionary loop. The loop iteratively generates new agent variants, evaluates them, and selects parents for the next generation based on scores stored in `report.json` files.
+
+Key concepts:
+
+- **`genid`** — a generation identifier. It is either the string `"initial"` or an integer `>= 0`.
+- **`output_dir`** — root directory for a run. Each generation lives in `{output_dir}/gen_{genid}/`.
+- **`archive`** — an ordered list of genids that have been evaluated, persisted as a JSONL file at `{output_dir}/archive.jsonl`.
+- **`domain`** — a benchmark domain string such as `"search_arena"`, `"balrog_babyai"`, `"genesis_locomotion"`, or `"polyglot"`.
+
+---
+
+## Scoring
+
+### `get_score`
+
+Reads the raw score for a single generation from its `report.json` file.
+
+```python
+from utils.gl_utils import get_score
+
+score = get_score("search_arena", "/runs/exp1", genid=3, split="val")
+```
+
+#### Signature
+
+```python
+def get_score(domain: str, output_dir: str, genid, split: str = "train") -> float | None
+```
+
+#### Parameters
+
+<ParamField path="domain" type="str" required>
+  Domain name string. Used to build the eval directory name and to look up the score key in `report.json`.
+</ParamField>
+
+<ParamField path="output_dir" type="str" required>
+  Path to the run's root output directory.
+</ParamField>
+
+<ParamField path="genid" type="str | int" required>
+  Generation identifier — `"initial"` or an integer.
+</ParamField>
+
+<ParamField path="split" type="str" default="train">
+  Evaluation split. `"train"` maps to `{domain}_eval/`, any other value (e.g. `"val"`, `"test"`) maps to `{domain}_eval_{split}/`.
+</ParamField>
+
+#### Return Value
+
+<ResponseField name="score" type="float | None">
+  The numeric score read from `report.json` under the key returned by `get_domain_score_key(domain)`. Returns `None` if the file is missing, the key is absent, or the value is `NaN`.
+
+  Special cases:
+  - **Balrog domains:** score is divided by `100.0` (normalised to `[0, 1]`). Returns `None` if no environments ran.
+  - **Polyglot domains:** returns `None` if no tasks completed without error.
+</ResponseField>
+
+---
+
+### `get_saved_score`
+
+Returns a score adjusted for whether a full or staged evaluation was run, and optionally returns the ensemble or max of agent and ensemble scores.
+
+```python
+from utils.gl_utils import get_saved_score
+
+score = get_saved_score("search_arena", "/runs/exp1", genid=3, split="val", type="max")
+```
+
+#### Signature
+
+```python
+def get_saved_score(
+    domain: str,
+    output_dir: str,
+    genid,
+    split: str = "train",
+    type: str = "agent",
+) -> float | None
+```
+
+#### Parameters
+
+<ParamField path="domain" type="str" required>
+  Domain name string.
+</ParamField>
+
+<ParamField path="output_dir" type="str" required>
+  Path to the run's root output directory.
+</ParamField>
+
+<ParamField path="genid" type="str | int" required>
+  Generation identifier.
+</ParamField>
+
+<ParamField path="split" type="str" default="train">
+  Evaluation split.
+</ParamField>
+
+<ParamField path="type" type="'agent' | 'ensemble' | 'max'" default="agent">
+  Which score to return:
+  - `"agent"` — the direct agent score from `report.json`.
+  - `"ensemble"` — the ensemble score from `report_ensemble_{domain}_{split}.json`.
+  - `"max"` — the higher of agent and ensemble scores.
+</ParamField>
+
+#### Return Value
+
+<ResponseField name="score" type="float | None">
+  The requested score. If the generation's metadata does not have `run_full_eval: true` (or the genid is `"initial"`), the raw score is multiplied by `get_domain_stagedeval_frac(domain)` to make it comparable to full-eval scores.
+</ResponseField>
+
+---
+
+## Archive Management
+
+### `update_and_save_archive`
+
+Appends a new generation to the in-memory archive list and persists a JSONL snapshot to disk.
+
+```python
+from utils.gl_utils import update_and_save_archive
+
+archive = update_and_save_archive("/runs/exp1", archive=["initial", 0, 1], new_node=2)
+```
+
+#### Signature
+
+```python
+def update_and_save_archive(output_dir: str, archive: list, new_node) -> list
+```
+
+#### Parameters
+
+<ParamField path="output_dir" type="str" required>
+  Run root directory. The archive is written to `{output_dir}/archive.jsonl`.
+</ParamField>
+
+<ParamField path="archive" type="list" required>
+  Current archive (list of genids). The new node is appended in place.
+</ParamField>
+
+<ParamField path="new_node" type="str | int" required>
+  The genid of the newly evaluated generation to append.
+</ParamField>
+
+#### Return Value
+
+<ResponseField name="archive" type="list">
+  The updated archive list (same object as the input, with `new_node` appended). Each line appended to `archive.jsonl` has the structure:
+  ```json
+  {"current_genid": <new_node>, "archive": [<all genids so far>]}
+  ```
+</ResponseField>
+
+---
+
+### `load_archive_data`
+
+Loads one or all snapshots from an `archive.jsonl` file.
+
+```python
+from utils.gl_utils import load_archive_data
+
+# Latest snapshot only (default)
+data = load_archive_data("/runs/exp1/archive.jsonl")
+print(data["archive"])  # list of all genids
+
+# All snapshots
+all_data = load_archive_data("/runs/exp1/archive.jsonl", last_only=False)
+```
+
+#### Signature
+
+```python
+def load_archive_data(filepath: str, last_only: bool = True) -> dict | list[dict]
+```
+
+#### Parameters
+
+<ParamField path="filepath" type="str" required>
+  Absolute path to the `archive.jsonl` file.
+</ParamField>
+
+<ParamField path="last_only" type="bool" default="true">
+  When `True`, returns only the last JSON entry (the most recent archive snapshot). When `False`, returns all entries as a list.
+</ParamField>
+
+#### Return Value
+
+<ResponseField name="archive_data" type="dict | list[dict]">
+  When `last_only=True`, a single dict `{"current_genid": ..., "archive": [...]}`. When `last_only=False`, a list of such dicts, one per line in the file. Raises `FileNotFoundError` if the file does not exist.
+</ResponseField>
+
+---
+
+## Parent Selection
+
+### `select_parent`
+
+Chooses the next parent generation from the current archive using one of several scoring-based strategies.
+
+```python
+from utils.gl_utils import select_parent
+
+parent_genid = select_parent(
+    archive=["initial", 0, 1, 2],
+    output_dir="/runs/exp1",
+    domains=["search_arena"],
+    method="best",
+)
+```
+
+#### Signature
+
+```python
+def select_parent(
+    archive: list,
+    output_dir: str,
+    domains: list[str],
+    method: str = "best",
+) -> str | int
+```
+
+#### Parameters
+
+<ParamField path="archive" type="list" required>
+  Ordered list of all genids in the current run.
+</ParamField>
+
+<ParamField path="output_dir" type="str" required>
+  Run root directory used to locate metadata and score files.
+</ParamField>
+
+<ParamField path="domains" type="list[str]" required>
+  List of domain names. Each domain's score is read for the best available split (`"val"` if supported, otherwise `"train"`). The per-domain scores are averaged to produce a single candidate score.
+</ParamField>
+
+<ParamField path="method" type="str" default="best">
+  Parent selection strategy:
+
+  | Value | Behaviour |
+  |---|---|
+  | `"random"` | Uniform random choice from valid candidates |
+  | `"latest"` | Most recently added valid candidate |
+  | `"best"` | Candidate with the highest average score |
+  | `"score_prop"` | Probabilistic, weighted by sigmoid-normalised scores |
+  | `"score_child_prop"` | Like `score_prop` but down-weights nodes with many children |
+</ParamField>
+
+#### Return Value
+
+<ResponseField name="genid" type="str | int">
+  The selected parent's generation identifier. Only generations with all domain scores available and `valid_parent: true` in their metadata are eligible. If no eligible candidates exist, falls back to the first node in the archive with score `0.0`.
+</ResponseField>
+
+---
+
+## Container Patch Application
+
+### `apply_diffs_container`
+
+Applies a sequence of git patch files to a running Docker container, staging and committing the result.
+
+```python
+from utils.gl_utils import apply_diffs_container
+
+commit_hash = apply_diffs_container(container, patch_files=["/tmp/parent.diff"])
+```
+
+#### Signature
+
+```python
+def apply_diffs_container(
+    container,
+    patch_files: list[str],
+    repo_name: str = REPO_NAME,
+    verbose: bool = True,
+) -> str
+```
+
+#### Parameters
+
+<ParamField path="container" type="docker.models.containers.Container" required>
+  A running Docker container object obtained from `docker.from_env().containers.get(...)`.
+</ParamField>
+
+<ParamField path="patch_files" type="list[str]" required>
+  Ordered list of absolute local paths to `.diff` patch files. Applied sequentially via `patch -p1`.
+</ParamField>
+
+<ParamField path="repo_name" type="str" default="hyperagents">
+  Name of the repository directory inside the container (the working directory for all git operations).
+</ParamField>
+
+<ParamField path="verbose" type="bool" default="true">
+  Whether to log container exec output via the thread-local logger.
+</ParamField>
+
+#### Return Value
+
+<ResponseField name="commit_hash" type="str">
+  The git commit hash after applying all patches. If any patches introduced changes a new commit is created; otherwise the existing `HEAD` hash is returned.
+
+  Changes to `domains/` are automatically filtered out of each patch before it is applied to avoid contaminating the container's domain configuration.
+</ResponseField>
+
+---
+
+### `get_patch_files`
+
+Returns the full ordered list of patch files needed to reconstruct a generation's lineage from the initial state.
+
+```python
+from utils.gl_utils import get_patch_files
+
+patches = get_patch_files("/runs/exp1", genid=3)
+# ['/runs/exp1/gen_0/patches/model_patch.diff',
+#  '/runs/exp1/gen_1/patches/model_patch.diff',
+#  '/runs/exp1/gen_3/patches/model_patch.diff']
+```
+
+#### Signature
+
+```python
+def get_patch_files(output_dir: str, genid) -> list[str]
+```
+
+#### Parameters
+
+<ParamField path="output_dir" type="str" required>
+  Run root directory.
+</ParamField>
+
+<ParamField path="genid" type="str | int" required>
+  Generation whose full patch lineage to retrieve.
+</ParamField>
+
+#### Return Value
+
+<ResponseField name="patch_files" type="list[str]">
+  Combined list of `prev_patch_files` (ancestor patches) and `curr_patch_files` (this generation's patches) read from `{output_dir}/gen_{genid}/metadata.json`. Returns an empty list if the metadata file does not exist.
+</ResponseField>

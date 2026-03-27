@@ -1,0 +1,249 @@
+---
+title: Agent Tools
+description: The tool system that agents use to interact with the environment, including shell execution and file editing.
+---
+
+## Overview
+
+Tools are self-contained modules in `agent/tools/`. Each module exposes two callables:
+
+- `tool_info()` — returns metadata used to build the tool-use prompt.
+- `tool_function` — the callable invoked when the agent emits a tool call.
+
+The loader (`agent/tools/__init__.py`) discovers and imports all tool modules at runtime.
+
+---
+
+## `load_tools`
+
+```python
+from agent.tools import load_tools
+
+# Load all tools
+tools = load_tools(logging=print, names='all')
+
+# Load specific tools by name
+tools = load_tools(logging=print, names=['bash', 'edit'])
+
+# Load no tools (disable tool use)
+tools = load_tools(logging=print, names=[])
+```
+
+### Signature
+
+```python
+def load_tools(logging=print, names=[]) -> list
+```
+
+### Parameters
+
+<ParamField path="logging" type="callable" default="print">
+  Logging function called with a single string on import errors.
+</ParamField>
+
+<ParamField path="names" type="list | 'all'" default="[]">
+  - `[]` — returns an empty list; no tools are active.
+  - `'all'` — loads every `*.py` file in `agent/tools/` except `__init__.py`.
+  - A list of stem names (e.g. `['bash', 'editor']`) — loads only the named modules.
+</ParamField>
+
+### Return Value
+
+<ResponseField name="tools" type="list[dict]">
+  List of tool dicts. Each dict has three keys:
+
+  ```python
+  {
+      "info":     <return value of module.tool_info()>,
+      "function": <module.tool_function callable>,
+      "name":     <module stem, e.g. "bash">,
+  }
+  ```
+</ResponseField>
+
+### Discovery Behaviour
+
+The loader uses `importlib.import_module` to import each candidate. A module is only included if it has **both** `tool_info` and `tool_function` attributes. Any module that lacks either attribute or raises an exception during import causes `load_tools` to re-raise the exception after logging it — partial tool sets are never silently returned.
+
+---
+
+## Tool Call Format
+
+The model emits tool calls as JSON wrapped in `<json>` tags:
+
+```json
+<json>
+{
+    "tool_name": "bash",
+    "tool_input": {
+        "command": "ls /tmp"
+    }
+}
+</json>
+```
+
+After the tool runs, the result is sent back to the model in the same format with an additional `tool_output` field:
+
+```json
+<json>
+{
+    "tool_name": "bash",
+    "tool_input": {"command": "ls /tmp"},
+    "tool_output": "file1.txt\nfile2.txt"
+}
+</json>
+```
+
+The model is instructed to use **only one tool per response** unless `multiple_tool_calls=True` is passed to `chat_with_agent`.
+
+---
+
+## Built-in Tools
+
+### `bash`
+
+Runs shell commands in a stateful bash session. Session state (environment variables, working directory, background processes) persists across calls within the same `chat_with_agent` invocation.
+
+**Tool name:** `bash`
+
+**Description (as shown to the model):**
+
+```
+Run commands in a bash shell
+* When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+* You don't have access to the internet via this tool.
+* You do have access to a mirror of common linux and python packages via apt and pip.
+* State is persistent across command calls and discussions with the user.
+* To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
+* Please avoid commands that may produce a very large amount of output.
+* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
+```
+
+**Input schema:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "command": {
+      "type": "string",
+      "description": "The bash command to run."
+    }
+  },
+  "required": ["command"]
+}
+```
+
+#### `tool_function(command)`
+
+```python
+def tool_function(command: str) -> str
+```
+
+<ParamField path="command" type="str" required>
+  The shell command to execute.
+</ParamField>
+
+**Returns:** Combined stdout and stderr as a single string. If there is stderr output it is appended after a `"\nError:\n"` separator. Returns an error string prefixed with `"Error: "` on session or timeout failures.
+
+**Implementation details:**
+
+- Runs via `asyncio.run(tool_function_call(command))`.
+- Each call creates a fresh `BashSession` that spawns `/bin/bash -i`.
+- Output is collected by waiting for a sentinel string (`<<exit>>`) appended after the command.
+- **Timeout:** 120 seconds. Exceeding it sets an internal `_timed_out` flag and raises `ValueError`.
+- `filter_error` strips spurious `ioctl` noise from stderr before returning.
+
+---
+
+### `editor`
+
+Views, creates, and edits files. Edit history is tracked in-process so individual edits can be undone.
+
+**Tool name:** `editor`
+
+**Description (as shown to the model):**
+
+```
+Custom editing tool for viewing, creating and editing files
+* State is persistent across command calls and discussions with the user
+* If `path` is a file, `view` displays the result of applying `cat -n`. If `path` is a directory,
+  `view` lists non-hidden files and directories up to 2 levels deep
+* The `create` command cannot be used if the specified `path` already exists as a file
+* If a `command` generates a long output, it will be truncated and marked with `<response clipped>`
+* The `undo_edit` command will revert the last edit made to the file at `path`
+```
+
+**Input schema:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "command":     { "type": "string", "enum": ["view", "create", "str_replace", "insert", "undo_edit"] },
+    "path":        { "type": "string", "description": "Absolute path to file or directory." },
+    "file_text":   { "type": "string", "description": "File content for `create`." },
+    "old_str":     { "type": "string", "description": "Exact string to replace (`str_replace`)." },
+    "new_str":     { "type": "string", "description": "Replacement string (`str_replace` / `insert`)." },
+    "insert_line": { "type": "integer", "description": "Line number after which to insert (`insert`)." },
+    "view_range":  { "type": "array",   "items": { "type": "integer" }, "description": "[start, end] line range for `view`." }
+  },
+  "required": ["command", "path"]
+}
+```
+
+#### `tool_function(command, path, ...)`
+
+```python
+def tool_function(
+    command: str,
+    path: str,
+    file_text: str | None = None,
+    view_range: list[int] | None = None,
+    old_str: str | None = None,
+    new_str: str | None = None,
+    insert_line: int | None = None,
+) -> str
+```
+
+<ParamField path="command" type="str" required>
+  Operation to perform. One of `view`, `create`, `str_replace`, `insert`, or `undo_edit`.
+</ParamField>
+
+<ParamField path="path" type="str" required>
+  Absolute path to a file or directory.
+</ParamField>
+
+<ParamField path="file_text" type="str">
+  Required for `create`. The full content of the file to create.
+</ParamField>
+
+<ParamField path="old_str" type="str">
+  Required for `str_replace`. The exact string to locate in the file. Must appear exactly once or the replacement is rejected.
+</ParamField>
+
+<ParamField path="new_str" type="str">
+  Required for `str_replace` (replacement text) and `insert` (text to insert).
+</ParamField>
+
+<ParamField path="insert_line" type="int">
+  Required for `insert`. New content is inserted **after** this 1-based line number. Pass `0` to insert before the first line.
+</ParamField>
+
+<ParamField path="view_range" type="[int, int]">
+  Optional for `view` on a file. `[start, end]` (1-based). Use `[start, -1]` to read to end-of-file.
+</ParamField>
+
+**Returns:** A human-readable result string. Long output is truncated at 10 000 characters with a `<response clipped>` marker inserted in the middle.
+
+**Command reference:**
+
+| Command | Effect |
+|---|---|
+| `view` | Print file with line numbers (`cat -n`) or list directory (2 levels deep) |
+| `create` | Create a new file. Fails if the path already exists |
+| `str_replace` | Replace an exact, unique substring in the file |
+| `insert` | Insert lines after a given line number |
+| `undo_edit` | Revert the last `str_replace` or `insert` on the given path |
+
+**Undo history** is kept in a module-level `FileHistory` instance (a dict of path → stack of previous contents). Only the most recent edit per file can be undone per `undo_edit` call.

@@ -1,0 +1,68 @@
+---
+title: "Safety"
+description: "Understand the risks of executing model-generated code and how to run HyperAgents safely."
+---
+
+<Warning>
+  **From the HyperAgents README:** This repository involves executing untrusted, model-generated code. We strongly advise users to be aware of the associated safety risks. While it is highly unlikely that such code will perform overtly malicious actions under our current settings and with the models we use, it may still behave destructively due to limitations in model capability or alignment. By using this repository, you acknowledge and accept these risks.
+</Warning>
+
+## The core risk
+
+HyperAgents is a **self-modifying system**. At each generation, the meta-agent writes Python code diffs (`model_patch.diff`) that are applied directly to the repository and then executed. The source of those diffs is an LLM — a model that has no formal guarantee of producing safe, correct, or non-destructive code.
+
+Potential failure modes include:
+
+- **Accidental destructive behavior** — a generated agent may delete files, corrupt outputs, or consume excessive compute/memory, not out of malice but because the model misunderstood its task.
+- **Alignment drift** — over many generations, subtle misalignment in the meta-agent's objectives could compound into behavior that diverges significantly from user intent.
+- **Capability limitations** — even state-of-the-art models can produce syntactically valid but semantically wrong code that breaks evaluation pipelines or produces misleading scores.
+
+## Why Docker sandboxing is used
+
+Every generation of HyperAgents runs the meta-agent and evaluates the produced task-agent inside an isolated Docker container built from the `hyperagents` image. This provides several layers of protection:
+
+- **Filesystem isolation** — the container has its own filesystem. Code running inside it cannot directly read or write files on the host outside of explicitly mounted volumes.
+- **Process isolation** — container processes cannot signal or inspect host processes.
+- **Reproducibility** — each container starts from a clean, known image state. Leftover state from a failed generation cannot contaminate the next run.
+- **Resource limits** — Docker can be configured with CPU/memory ceilings to prevent runaway resource consumption.
+
+After each generation completes (or fails), `generate_loop.py` calls `cleanup_container()` to stop and remove the container, and resets the repository inside it to the root commit via `git reset --hard` and `git clean -fd`.
+
+<Note>
+  The sandboxing described here is the approach taken in the research codebase. It meaningfully reduces risk but is **not a complete security boundary**. Determined or badly misaligned code could still cause harm within the bounds of what the container is permitted to do (e.g., making network requests, consuming disk quota inside the container's writable layer).
+</Note>
+
+## Research context
+
+<Note>
+  HyperAgents is a **research prototype** published alongside the paper arXiv:2603.19461. It is not a production system. The safety posture is appropriate for controlled research experiments, not for deployment in untrusted or production environments.
+</Note>
+
+The experiments in the paper were conducted with well-aligned frontier models (Claude, GPT-4o, Gemini) that are unlikely to produce overtly malicious output. However, the system is explicitly designed to push model behavior in novel directions over many generations — which is precisely the regime where alignment guarantees are weakest.
+
+## Recommendations for safe operation
+
+**Use Docker.** Never disable or bypass the Docker sandbox. The `generate_loop.py` entry point always runs evaluation inside a container — do not modify this behavior.
+
+**Run on an isolated machine.** Prefer running HyperAgents on a dedicated machine or VM that does not hold sensitive data or credentials beyond what is needed for the experiment.
+
+**Do not put sensitive data in the repository.** The entire repository is copied into the Docker container at each generation (`COPY . .` in the Dockerfile). Avoid placing secrets, private datasets, or credentials anywhere in the repo tree. Use the `.env` file for API keys and ensure it is listed in `.gitignore`.
+
+**Monitor outputs.** Review the `model_patch.diff` files produced each generation. They are small unified diffs and are human-readable. If a diff looks unexpected or dangerous, stop the run before the next generation begins.
+
+**Set resource limits.** Configure Docker with appropriate memory and CPU limits for your hardware. This prevents a runaway generation from starving other processes.
+
+**Keep `max_generation` small when exploring.** Start with `--max_generation 5` or fewer when running a new domain or model configuration. Only increase once you are confident the system is behaving as expected.
+
+```bash
+# Example: run with a small generation budget to inspect behavior first
+python generate_loop.py --domains paper_review --max_generation 5
+```
+
+## Acknowledging the risks
+
+By running this software you acknowledge, as stated in the repository license and README, that:
+
+- Model-generated code is executed on your infrastructure.
+- The authors and Meta Research cannot guarantee that all generated code is safe.
+- You take responsibility for the environment in which you run the system.

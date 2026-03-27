@@ -1,0 +1,207 @@
+---
+title: IMO
+description: Two International Mathematical Olympiad benchmark domains — grading student answers and generating full proofs.
+---
+
+HyperAgents includes two IMO-related domains sourced from the [Google DeepMind superhuman/imobench](https://github.com/google-deepmind/superhuman) dataset. They test different aspects of mathematical reasoning:
+
+- **`imo_grading`** — evaluate a student's written answer against official grading rubrics
+- **`imo_proof`** — write a complete mathematical proof for an IMO problem
+
+## Dataset Setup
+
+Both domains share the same dataset, which must be downloaded before first use:
+
+```bash
+bash domains/imo/setup.sh
+```
+
+This script:
+1. Clones the `google-deepmind/superhuman` repository at a pinned commit (`c1ee02e`)
+2. Copies the `imobench/*.csv` files into `domains/imo/`
+3. Removes the cloned repository
+4. Runs `python -m domains.imo.curate_subsets` to generate balanced filtered subsets
+
+---
+
+## imo_grading
+
+### What It Evaluates
+
+Given an IMO problem, its official solution, grading guidelines, and a student's answer, the agent must predict the grade that a human marker would assign. Grades are drawn from four discrete labels: `incorrect`, `partial`, `almost`, `correct`.
+
+This is a classification task. Scoring uses two metrics:
+
+- **`overall_accuracy`** — exact-match label accuracy
+- **Normalized MAE** — mean absolute error over the point mapping `{incorrect: 0, partial: 1, almost: 6, correct: 7}`, normalized by the maximum score of 7
+
+### Dataset Format
+
+Each row in the grading CSV represents one graded answer:
+
+| Column | Description |
+|---|---|
+| `Grading ID` | Unique identifier |
+| `Problem` | The IMO problem statement |
+| `Solution` | The official reference solution |
+| `Grading guidelines` | Official rubric |
+| `Response` | Student's answer |
+| `Reward` | Ground truth grade: `incorrect`, `partial`, `almost`, or `correct` |
+
+```python
+# domains/imo/grading_utils.py
+QUESTION_ID = "Grading ID"
+GROUND_TRUTH_KEY = "Reward"
+MODEL = "gpt-o4-mini-genai"
+
+def format_input_dict(row):
+    return {
+        "domain": "imo_grading",
+        "problem": row['Problem'],
+        "solution": row['Solution'],
+        "grading_guidelines": row['Grading guidelines'],
+        "student_answer": row['Response'],
+    }
+```
+
+### Dataset Subsets
+
+Filtered subsets follow the same convention as `paper_review`:
+
+```
+domains/imo/gradingbench_filtered_100_train.csv
+domains/imo/gradingbench_filtered_100_val.csv
+domains/imo/gradingbench_filtered_100_test.csv
+```
+
+### Setup and Run
+
+<Steps>
+  <Step title="Download the dataset">
+    ```bash
+    bash domains/imo/setup.sh
+    ```
+  </Step>
+  <Step title="Run evaluation">
+    ```bash
+    python -m domains.harness \
+      --domain imo_grading \
+      --run_id initial_imo_grading_filtered_100_train_0 \
+      --subset _filtered_100_train \
+      --num_samples 10
+    ```
+  </Step>
+  <Step title="Generate the report">
+    ```bash
+    python -m domains.report --domain imo_grading \
+      --dname ./outputs/initial_imo_grading_filtered_100_train_0
+    ```
+
+    The report includes both `overall_accuracy` and `normalized_mean_absolute_error`.
+  </Step>
+</Steps>
+
+---
+
+## imo_proof
+
+### What It Evaluates
+
+Given an IMO problem statement, the agent must generate a complete mathematical proof. Proofs are not evaluated directly; they are passed to a separate **proof-grading agent** (`imo_proof_grading`) which assigns a grade using the same four-label rubric as `imo_grading`.
+
+The primary score key is **`points_percentage`** — the fraction of total possible points (7 per problem) earned across all problems:
+
+```python
+# domains/imo/proof_eval.py
+MAX_POINTS = 7
+points_percentage = preds.sum() / (MAX_POINTS * total)
+```
+
+### Dataset Format
+
+The proof dataset CSV has one row per IMO problem:
+
+| Column | Description |
+|---|---|
+| `Problem ID` | Unique identifier |
+| `Problem` | The problem statement |
+| `Solution` | Reference solution (used by the grader, not the agent) |
+
+```python
+# domains/imo/proof_utils.py
+QUESTION_ID = "Problem ID"
+GROUND_TRUTH_KEY = "Solution"  # used by grader only
+MODEL = "gpt-o4-mini-genai"
+
+def format_input_dict(row):
+    return {
+        "domain": "imo_proof",
+        "problem": row['Problem'],
+    }
+```
+
+### Proof Grader Setup
+
+The `imo_proof` reporting pipeline depends on a `proofgrader` Python package that is generated from the current codebase. This must be set up before running `domains.report` on proof outputs.
+
+<Steps>
+  <Step title="Download the dataset">
+    ```bash
+    bash domains/imo/setup.sh
+    ```
+  </Step>
+  <Step title="Build the proof grader package">
+    ```bash
+    # Option A: use the built-in ProofAutoGrader baseline
+    python -m domains.imo.setup_proofgrader_repo --proofautograder
+
+    # Option B: use the best agent from a completed imo_grading optimization run
+    python -m domains.imo.setup_proofgrader_repo --generate_dir <path_to_run>
+    ```
+
+    This copies the current repo into `./proofgrader_repo/`, re-packages it as the `proofgrader` Python package, and rewrites internal imports.
+  </Step>
+  <Step title="Install the proof grader">
+    ```bash
+    pip install -e ./proofgrader_repo
+    ```
+  </Step>
+  <Step title="Generate proofs">
+    ```bash
+    python -m domains.harness \
+      --domain imo_proof \
+      --run_id initial_imo_proof_0 \
+      --num_samples 10
+    ```
+  </Step>
+  <Step title="Grade and report">
+    ```bash
+    python -m domains.report --domain imo_proof \
+      --dname ./outputs/initial_imo_proof_0
+    ```
+
+    This automatically runs the `imo_proof_grading` harness on the generated proofs, then calls `report_proof_grading` to produce `report.json`.
+  </Step>
+</Steps>
+
+### Reporting Pipeline
+
+The `report.py` two-stage pipeline for `imo_proof`:
+
+1. **Grading**: runs `harness(domain="imo_proof_grading", agent_path="proofgrader.task_agent", ...)` against the generated proofs
+2. **Scoring**: calls `report_proof_grading()` which computes `points_percentage` and `correct_percentage`
+3. **Report file**: moved to `<dname>/report.json`
+
+<Warning>
+  `imo_proof_grading` requires `--proofs_dname` to point to the directory containing the generated `predictions.csv`. This is handled automatically by `report.py` but must be set manually if invoking the harness directly.
+</Warning>
+
+## Domain Properties
+
+| Property | `imo_grading` | `imo_proof` |
+|---|---|---|
+| Score key | `overall_accuracy` | `points_percentage` |
+| Splits | train / val / test | train only |
+| Eval subset | `_filtered_100_train` | — |
+| Ensemble supported | Yes | No |
+| Staged eval samples | 10 / 100 (10%) | 10 / 60 (~17%) |

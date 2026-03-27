@@ -1,23 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "HyperAgents",
+  "projectType": "ai-ml",
+  "projectName": "HyperAgents",
+  "projectDescription": "A self-referential self-improving agent framework from Meta Research that uses a meta-agent to iteratively evolve task agents across diverse benchmark domains.",
   "theme": "luma",
-  "colors": {
-    "primary": "#94cb04",
-    "light": "#545454"
-  },
-  "favicon": "/favicon.png",
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/facebookresearch/HyperAgents"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/facebookresearch/HyperAgents"
-    }
-  },
+  "primaryColor": "#94cb04",
+  "lightColor": "#545454",
+  "darkColor": null,
   "navigation": {
     "tabs": [
       {
@@ -100,5 +88,25 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Self-referential self-improvement: the meta-agent can modify its own code and agent architecture",
+    "Multi-domain evaluation across diverse benchmarks (search, games, robotics, math, coding)",
+    "Docker-based sandbox execution for safe evaluation of model-generated code",
+    "Archive-based parent selection with configurable strategies (score_prop, score_child_prop, best, random)",
+    "Staged evaluation pipeline to reduce compute costs",
+    "Ensemble scoring across multiple evolved agent generations",
+    "Support for multiple LLM backends via LiteLLM (OpenAI, Anthropic, Gemini)",
+    "Configurable optimization modes: agent-only, ensemble-only, or both"
+  ],
+  "publicApiSurface": [
+    "generate_loop() — main entry point for the evolutionary self-improvement loop",
+    "MetaAgent.forward(repo_path, eval_path, iterations_left) — runs the meta-agent to modify the codebase",
+    "TaskAgent.forward(inputs) — runs the task agent on a given domain input",
+    "AgentSystem — abstract base class for all agents",
+    "chat_with_agent(msg, model, msg_history, tools_available) — LLM chat loop with tool use",
+    "get_response_from_llm(msg, model, temperature, max_tokens, msg_history) — single LLM call via LiteLLM",
+    "harness(agent_path, domain, num_samples, num_workers) — domain evaluation harness",
+    "python generate_loop.py --domains <domain> [--max_generation N] [--parent_selection ...] [--run_baseline ...]"
+  ]
 }

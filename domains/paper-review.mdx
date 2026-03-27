@@ -1,0 +1,130 @@
+---
+title: Paper Review
+description: Evaluate agent ability to predict academic paper review outcomes (accept vs. reject) from full paper text.
+---
+
+The `paper_review` domain tests whether an agent can replicate the judgment of human peer reviewers. Given the full text of an academic paper, the agent must predict whether the paper was ultimately **accepted** or **rejected**.
+
+## What It Evaluates
+
+This is a binary classification task framed as a preference-judgment problem. The ground truth is the actual outcome from a real peer-review process. The domain measures:
+
+- **Overall accuracy** — fraction of papers where the agent's prediction matches the actual outcome
+- **Per-label precision and recall** — separately for `accept` and `reject`
+- **Label distribution alignment** — how closely the predicted accept/reject ratio matches the ground truth distribution
+
+## Dataset Format
+
+The dataset is stored at `domains/paper_review/dataset.csv`. Each row represents one paper:
+
+| Column | Description |
+|---|---|
+| `question_id` | Unique identifier for the paper |
+| `paper_text` | Full text of the paper |
+| `outcome` | Ground truth label: `accept` or `reject` |
+
+The `utils.py` constants confirm this layout:
+
+```python
+# domains/paper_review/utils.py
+QUESTION_ID = "question_id"
+GROUND_TRUTH_KEY = "outcome"
+MODEL = "gpt-4o"
+```
+
+The `format_input_dict` function passes `paper_text` to the agent:
+
+```python
+def format_input_dict(row):
+    return {
+        "domain": "paper_review",
+        "paper_text": row['paper_text'],
+    }
+```
+
+## Dataset Subsets
+
+The raw `dataset.csv` is split into balanced train/val/test subsets using `curate_subsets.py`. Each split contains **100 samples** (50 accept, 50 reject) with no overlap between splits.
+
+The curated subset files follow the naming convention:
+
+```
+domains/paper_review/dataset_filtered_100_train.csv
+domains/paper_review/dataset_filtered_100_val.csv
+domains/paper_review/dataset_filtered_100_test.csv
+```
+
+The `_filtered_100_train` suffix is the default evaluation subset (see `get_domain_eval_subset`).
+
+## Setup
+
+<Steps>
+  <Step title="Curate dataset subsets">
+    Generate the balanced train/val/test CSV files:
+
+    ```bash
+    python -m domains.paper_review.curate_subsets
+    ```
+  </Step>
+  <Step title="Run the initial evaluation">
+    Evaluate the default agent on each split:
+
+    ```bash
+    python -m domains.harness \
+      --domain paper_review \
+      --run_id initial_paper_review_filtered_100_train_0 \
+      --subset _filtered_100_train \
+      --num_samples 10
+
+    python -m domains.harness \
+      --domain paper_review \
+      --run_id initial_paper_review_filtered_100_val_0 \
+      --subset _filtered_100_val \
+      --num_samples 10
+
+    python -m domains.harness \
+      --domain paper_review \
+      --run_id initial_paper_review_filtered_100_test_0 \
+      --subset _filtered_100_test \
+      --num_samples 10
+    ```
+  </Step>
+  <Step title="Generate the report">
+    Compute accuracy and per-label statistics:
+
+    ```bash
+    python -m domains.report --domain paper_review \
+      --dname ./outputs/initial_paper_review_filtered_100_train_0
+
+    python -m domains.report --domain paper_review \
+      --dname ./outputs/initial_paper_review_filtered_100_val_0
+
+    python -m domains.report --domain paper_review \
+      --dname ./outputs/initial_paper_review_filtered_100_test_0
+    ```
+  </Step>
+</Steps>
+
+## Scoring
+
+The primary metric is **`overall_accuracy`** — the fraction of papers where the agent's prediction exactly matches the ground truth outcome (case-insensitive string comparison).
+
+The `report.py` script also outputs:
+
+- **Per-label precision and recall** for `accept` and `reject`
+- **Random-guess baseline accuracy** computed from the ground truth label distribution
+- **Prediction and ground truth label distributions**
+- Lists of `question_ids_passed` and `question_ids_failed`
+
+The report is saved as `report.json` in the output directory.
+
+## Harness Behavior
+
+- **Parallelism**: controlled by `--num_workers` (default: 5). The domain supports parallel evaluation.
+- **Resuming**: pass `--resume_from <output_dir>` to continue an interrupted run. Already-completed question IDs are skipped.
+- **Save interval**: predictions are checkpointed to `predictions.csv` every `--save_interval` samples (default: 100).
+- **Ensemble**: `can_domain_ensembled("paper_review")` returns `True`, so multiple agent runs can be aggregated.
+
+<Note>
+  The default model (`MODEL = "gpt-4o"`) is passed to `TaskAgent` at construction time. Your `TaskAgent` can ignore it or use it to configure the underlying LLM client.
+</Note>

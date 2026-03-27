@@ -1,0 +1,280 @@
+---
+title: Docker Utilities
+description: Functions for building, managing, and interacting with Docker containers used to isolate agent evaluation runs.
+---
+
+## Overview
+
+`utils/docker_utils.py` provides a thin layer over the [Docker SDK for Python](https://docker-py.readthedocs.io/) to manage the lifecycle of evaluation containers and transfer files between the host and container.
+
+Containers are used to provide reproducible, isolated environments for running agent-generated code. Each container mounts the HyperAgents repository directory as a read-write volume at `/{REPO_NAME}` (default: `/hyperagents`).
+
+---
+
+## Logging
+
+### `setup_logger`
+
+Creates a thread-safe file logger. Because evaluations can run in parallel threads, each thread maintains its own logger in thread-local storage.
+
+```python
+from utils.docker_utils import setup_logger
+
+logger = setup_logger("/runs/exp1/worker_0.log")
+```
+
+#### Signature
+
+```python
+def setup_logger(log_file: str) -> logging.Logger
+```
+
+#### Parameters
+
+<ParamField path="log_file" type="str" required>
+  Absolute or relative path to the log file. The file is created or appended to.
+</ParamField>
+
+#### Return Value
+
+<ResponseField name="logger" type="logging.Logger">
+  A `logging.Logger` instance configured with:
+  - Level: `INFO`
+  - Handler: `FileHandler` with a thread-safe `Lock` on its stream
+  - Format: `%(asctime)s - %(threadName)s - %(levelname)s - %(message)s`
+
+  The logger is also stored in thread-local storage and can be retrieved with `get_thread_logger()`.
+</ResponseField>
+
+---
+
+## Container Lifecycle
+
+### `build_container`
+
+Builds a Docker image (if needed) and starts a new named container from it. The container is started in detached mode and kept alive with `tail -f /dev/null`.
+
+```python
+import docker
+from utils.docker_utils import build_container
+
+client = docker.from_env()
+container = build_container(
+    client=client,
+    repo_path="./",
+    image_name="hyperagents",
+    container_name="hyperagents-run-0",
+    domains=["search_arena"],
+    verbose=True,
+)
+```
+
+#### Signature
+
+```python
+def build_container(
+    client,
+    repo_path: str = "./",
+    image_name: str = "app",
+    container_name: str = "app-container",
+    force_rebuild: bool = False,
+    domains: list[str] | None = None,
+    verbose: bool = True,
+) -> docker.models.containers.Container | None
+```
+
+#### Parameters
+
+<ParamField path="client" type="docker.DockerClient" required>
+  An initialised Docker client, typically from `docker.from_env()`.
+</ParamField>
+
+<ParamField path="repo_path" type="str" default="./">
+  Path to the directory containing the `Dockerfile`. Also mounted as a volume inside the container at `/{REPO_NAME}`.
+</ParamField>
+
+<ParamField path="image_name" type="str" default="app">
+  Tag for the Docker image to build or reuse.
+</ParamField>
+
+<ParamField path="container_name" type="str" default="app-container">
+  Name for the new container. Any existing container with this name is forcibly removed before starting.
+</ParamField>
+
+<ParamField path="force_rebuild" type="bool" default="false">
+  When `True`, rebuilds the image from scratch even if a tag with `image_name` already exists (`nocache=True`).
+</ParamField>
+
+<ParamField path="domains" type="list[str] | None" default="None">
+  List of domain names active in this run. If any domain contains `"genesis"`, GPU passthrough is attempted. Supports both Docker (via `device_requests`) and Podman (via CDI `nvidia.com/gpu=all`).
+</ParamField>
+
+<ParamField path="verbose" type="bool" default="true">
+  Whether to emit build and startup progress to the thread-local logger.
+</ParamField>
+
+#### Return Value
+
+<ResponseField name="container" type="docker.models.containers.Container | None">
+  The running container object, or `None` if image build or container startup failed.
+</ResponseField>
+
+---
+
+### `cleanup_container`
+
+Stops and removes a container gracefully.
+
+```python
+from utils.docker_utils import cleanup_container
+
+cleanup_container(container, verbose=True)
+```
+
+#### Signature
+
+```python
+def cleanup_container(
+    container: docker.models.containers.Container,
+    verbose: bool = True,
+) -> None
+```
+
+#### Parameters
+
+<ParamField path="container" type="docker.models.containers.Container" required>
+  A Docker container object to stop and remove.
+</ParamField>
+
+<ParamField path="verbose" type="bool" default="true">
+  Whether to log stop/remove progress and any errors.
+</ParamField>
+
+Stop and remove errors are caught and logged separately; neither prevents the other from being attempted.
+
+---
+
+## File Transfer
+
+### `copy_to_container`
+
+Copies a file or directory from the local filesystem into a running container using an in-memory tar archive.
+
+```python
+from utils.docker_utils import copy_to_container
+
+copy_to_container(container, "/tmp/patch.diff", "/hyperagents/patch.diff")
+```
+
+#### Signature
+
+```python
+def copy_to_container(
+    container,
+    source_path: str | Path,
+    dest_path: str | Path,
+    verbose: bool = True,
+) -> None
+```
+
+#### Parameters
+
+<ParamField path="container" type="docker.models.containers.Container" required>
+  Target running container.
+</ParamField>
+
+<ParamField path="source_path" type="str | Path" required>
+  Local path to the file or directory to copy. Raises `FileNotFoundError` if it does not exist.
+</ParamField>
+
+<ParamField path="dest_path" type="str | Path" required>
+  Destination path inside the container. The parent directory is created with `mkdir -p` if it does not exist. For a file, `dest_path.name` becomes the archive entry name; for a directory, `dest_path.name` becomes the top-level directory name in the archive.
+</ParamField>
+
+<ParamField path="verbose" type="bool" default="true">
+  Whether to log the copy result.
+</ParamField>
+
+#### Return Value
+
+`None`. Raises an exception on failure.
+
+---
+
+### `copy_from_container`
+
+Copies a file or directory from a running container to the local filesystem.
+
+```python
+from utils.docker_utils import copy_from_container
+
+copy_from_container(container, "/hyperagents/outputs/report.json", "/runs/exp1/gen_3/report.json")
+```
+
+#### Signature
+
+```python
+def copy_from_container(
+    container,
+    source_path: str | Path,
+    dest_path: str | Path,
+    verbose: bool = True,
+) -> None
+```
+
+#### Parameters
+
+<ParamField path="container" type="docker.models.containers.Container" required>
+  Source running container.
+</ParamField>
+
+<ParamField path="source_path" type="str | Path" required>
+  Path inside the container to copy. Raises `FileNotFoundError` if it does not exist in the container.
+</ParamField>
+
+<ParamField path="dest_path" type="str | Path" required>
+  Local destination path. Parent directories are created automatically.
+</ParamField>
+
+<ParamField path="verbose" type="bool" default="true">
+  Whether to log the copy result and errors.
+</ParamField>
+
+#### Return Value
+
+`None`. Raises an exception on failure.
+
+---
+
+## Execution Output
+
+### `log_container_output`
+
+Logs the output of a `container.exec_run(...)` call and raises an exception if the command exited with a non-zero exit code.
+
+```python
+from utils.docker_utils import log_container_output
+
+exec_result = container.exec_run("git status", workdir="/hyperagents")
+log_container_output(exec_result, verbose=True)
+```
+
+#### Signature
+
+```python
+def log_container_output(exec_result, verbose: bool = True) -> None
+```
+
+#### Parameters
+
+<ParamField path="exec_result" type="docker ExecResult" required>
+  The object returned by `container.exec_run(...)`. Expected to have `.output` (bytes or iterator of bytes) and `.exit_code` (int or None) attributes.
+</ParamField>
+
+<ParamField path="verbose" type="bool" default="true">
+  When `False`, all logging is suppressed (the exit code check still applies).
+</ParamField>
+
+#### Return Value
+
+`None`. Raises `Exception` with the message `"Script failed with exit code {exit_code}"` if `exec_result.exit_code` is non-zero. Handles both streaming (iterator) and non-streaming (bytes) output transparently.

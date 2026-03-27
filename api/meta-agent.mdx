@@ -1,0 +1,170 @@
+---
+title: "MetaAgent"
+description: "A self-improving agent that modifies the HyperAgents codebase. Extends AgentSystem with full tool access."
+---
+
+## Overview
+
+`MetaAgent` (defined in `meta_agent.py`) is the top-level agent responsible for recursive self-improvement. Given a repository path and a folder of previous evaluation results, it uses `chat_with_agent` with all tools enabled to freely read, edit, and write any file in the codebase. After it finishes, the runner saves a `git diff` of every change made and resets the `domains/` directory to keep evaluation scaffolding pristine.
+
+`MetaAgent` extends [`AgentSystem`](/api/agent-system) and adds no new constructor parameters — it only implements `forward`.
+
+## Source
+
+```python meta_agent.py
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+
+from agent.base_agent import AgentSystem
+from agent.llm_withtools import chat_with_agent
+
+class MetaAgent(AgentSystem):
+    def forward(self, repo_path, eval_path, iterations_left=None):
+        """
+        A meta agent that recursively self-improves.
+
+        Args:
+            repo_path (str): The path to the repository.
+            eval_path (str): The path to previously generated agents and their evaluation results.
+            iterations_left (int, optional): The number of remaining iterations in which the meta
+                agent will be invoked in future. Defaults to None.
+        """
+        instruction = f"Modify any part of the codebase at `{repo_path}`."
+
+        new_msg_history = chat_with_agent(
+            instruction,
+            model=self.model,
+            msg_history=[],
+            logging=self.log,
+            tools_available='all',
+        )
+```
+
+## Constructor
+
+`MetaAgent` inherits the constructor from `AgentSystem` unchanged.
+
+```python
+MetaAgent(model=OPENAI_MODEL, chat_history_file='./outputs/chat_history.md')
+```
+
+See [`AgentSystem`](/api/agent-system#constructor) for parameter details. When invoked from `run_meta_agent.py`, the default model is `CLAUDE_MODEL` (`"anthropic/claude-sonnet-4-5-20250929"`).
+
+## `forward`
+
+```python
+MetaAgent.forward(repo_path, eval_path, iterations_left=None)
+```
+
+Sends a single instruction to the LLM with `tools_available='all'`, then lets the agent loop autonomously until it stops calling tools (or hits the 40-call limit set by `chat_with_agent`).
+
+### Parameters
+
+<ParamField path="repo_path" type="str" required>
+  Filesystem path to the repository the agent is allowed to modify. This value
+  is interpolated directly into the instruction string:
+
+  ```
+  "Modify any part of the codebase at `{repo_path}`."
+  ```
+
+  The agent receives this as its sole directive and may read, create, edit, or
+  delete any file under that path using the loaded tools.
+</ParamField>
+
+<ParamField path="eval_path" type="str" required>
+  Path to a folder containing previously generated agents and their evaluation
+  results (e.g. `./outputs/`). This is passed to `forward` so the agent knows
+  where to look for prior iteration context. The parameter is accepted by the
+  method signature but is not currently interpolated into the instruction string
+  — it is available for subclasses or future versions to use.
+</ParamField>
+
+<ParamField path="iterations_left" type="int" default="None">
+  How many more meta-agent iterations are scheduled after this one. Passed
+  through from the CLI (`--iterations_left`). Not used in the current instruction
+  string, but available to the agent via the method signature for context-aware
+  planning in future versions.
+</ParamField>
+
+### Return Value
+
+`forward` returns `None`. All meaningful output is the set of file modifications made to `repo_path` on disk. The caller (`run_meta_agent.py`) captures those changes via `git diff`.
+
+<Warning>
+  `MetaAgent.forward` calls `chat_with_agent` with `tools_available='all'`, which
+  loads every tool available in `agent/tools/`. This includes file read, write,
+  and shell execution tools. Run `MetaAgent` only against repositories you
+  control and in an isolated environment.
+</Warning>
+
+## Post-processing (run_meta_agent.py)
+
+The entry point `run_meta_agent.py` performs two steps after `forward` returns:
+
+1. **Reset `domains/`** — calls `reset_paths_to_commit(git_dname, base_commit, paths=["domains/"])` to undo any changes the agent made to the evaluation harness, ensuring benchmarks are not contaminated.
+2. **Save the diff** — calls `diff_versus_commit(git_dir, base_commit)` and writes the result to `{outdir}/model_patch.diff`. This patch file is the canonical output of a meta-agent run.
+
+```python run_meta_agent.py
+# Reset unwanted diffs
+reset_paths_to_commit(
+    git_dname=args.git_dir, commit=args.base_commit, paths=["domains/"]
+)
+
+# Save git diff
+model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+model_patch_outfile = (
+    os.path.join(args.outdir, "model_patch.diff")
+    if args.outdir
+    else "model_patch.diff"
+)
+with open(model_patch_outfile, "w") as f:
+    f.write(model_patch)
+```
+
+## Examples
+
+### Python
+
+```python
+from meta_agent import MetaAgent
+from agent.llm import CLAUDE_MODEL
+
+agent = MetaAgent(
+    model=CLAUDE_MODEL,
+    chat_history_file="./outputs/chat_history.md",
+)
+agent.forward(
+    repo_path="./",
+    eval_path="./outputs/",
+    iterations_left=2,
+)
+```
+
+### CLI
+
+`run_meta_agent.py` is the standard entry point. `--git_dir` and `--base_commit` are required so the runner can compute and save the diff.
+
+```bash
+python run_meta_agent.py \
+  --model anthropic/claude-sonnet-4-5-20250929 \
+  --repo_path ./ \
+  --evals_folder ./outputs/ \
+  --iterations_left 2 \
+  --git_dir ./ \
+  --base_commit abc1234 \
+  --outdir ./outputs/ \
+  --chat_history_file ./outputs/chat_history.md
+```
+
+<Expandable title="All CLI arguments">
+  | Argument | Type | Default | Description |
+  |---|---|---|---|
+  | `--model` | str | `CLAUDE_MODEL` | LLM model identifier |
+  | `--chat_history_file` | str | `./outputs/chat_history.md` | Path for conversation log |
+  | `--repo_path` | str | `./` | Repository to modify |
+  | `--evals_folder` | str | `./outputs/` | Folder with prior evaluation results |
+  | `--iterations_left` | int | `None` | Remaining future iterations |
+  | `--git_dir` | str | *(required)* | Git repository root |
+  | `--base_commit` | str | *(required)* | Commit hash to diff against |
+  | `--outdir` | str | `./outputs/` | Directory for `model_patch.diff` |
+</Expandable>

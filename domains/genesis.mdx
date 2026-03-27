@@ -1,0 +1,154 @@
+---
+title: Genesis
+description: Evaluate agents that write reward functions for RL-based robotic locomotion control of the Unitree Go2 quadruped.
+---
+
+The Genesis domain evaluates agents that generate reward functions for reinforcement learning controllers. The agent is given a task description and must write a Python reward function that, when used to train an RL policy, produces the desired locomotion behavior in the [Genesis](https://github.com/Genesis-Embodied-AI/Genesis) physics simulator.
+
+## What It Evaluates
+
+Genesis tests **reward function engineering** ability. The agent's output (a reward function) is not judged directly; instead, it is used to train an RL policy via `rsl-rl`, and the resulting policy's behavior is evaluated in simulation. The primary metric is **`average_fitness`** — a normalized 0–1 score measuring how well the trained policy executes the task.
+
+### Evaluation Setup
+
+- **Total simulation time**: 20 seconds per evaluation
+- **Episode duration**: 4.0 seconds (200 steps at dt = 0.02 s)
+- **Parallel environments**: 4096 simulated simultaneously
+- **Fitness score range**: 0 (worst) to 1 (best)
+- **RL training**: 101 policy update iterations before evaluation
+- **Early termination**: an episode ends early if the robot falls (roll or pitch > 10°)
+
+## The Three Environments
+
+<Tabs>
+  <Tab title="go2walking">
+    **Go2WalkingCommand-v0** — The Unitree Go2 robot must learn to walk forward at a commanded speed.
+
+    - Task: `Go2WalkingCommand-v0/speed`
+    - Linear velocity range: `[0.2, 0.8]` m/s in the x direction
+    - Default episodes: 6
+    - Domain: `genesis_go2walking`
+  </Tab>
+  <Tab title="go2walkback">
+    **Go2WalkBackCommand-v0** — The robot must learn to walk backward at a commanded speed.
+
+    - Task: `Go2WalkBackCommand-v0/speed`
+    - Linear velocity range: `[-0.2, -0.8]` m/s in the x direction
+    - Default episodes: 6
+    - Domain: `genesis_go2walkback`
+  </Tab>
+  <Tab title="go2hop">
+    **Go2HoppingCommand-v0** — The robot must learn to jump as high as possible.
+
+    - Task: `Go2HoppingCommand-v0/hop`
+    - Default episodes: 6
+    - Domain: `genesis_go2hop`
+  </Tab>
+</Tabs>
+
+## Requirements
+
+<Warning>
+  Genesis requires a CUDA-compatible GPU. PyTorch must be installed before Genesis, and the correct PyTorch version depends on your CUDA version.
+</Warning>
+
+### Install PyTorch
+
+Check your CUDA version first:
+
+```bash
+nvidia-smi
+```
+
+Then install the matching PyTorch version following the [official guide](https://pytorch.org/get-started/previous-versions/).
+
+### Install Genesis
+
+```bash
+pip install --upgrade pip
+pip install git+https://github.com/Genesis-Embodied-AI/Genesis.git
+pip install rsl-rl-lib==2.2.4 tensorboard==2.20.0
+```
+
+## Setup and Run
+
+<Steps>
+  <Step title="Run the initial evaluation">
+    ```bash
+    python -m domains.harness \
+      --domain genesis_go2walking \
+      --run_id initial_genesis_go2walking_0 \
+      --num_samples 3
+    ```
+  </Step>
+  <Step title="Generate the report">
+    ```bash
+    python -m domains.report --domain genesis_go2walking \
+      --dname ./outputs/initial_genesis_go2walking_0
+    ```
+  </Step>
+</Steps>
+
+## `num_workers` Constraint
+
+<Warning>
+  Genesis **must** be run with `--num_workers 1`. The harness enforces this automatically — regardless of the value passed via `--num_workers`, the Genesis branch in `harness.py` hardcodes `num_workers = 1` before composing the Hydra config:
+
+  ```python
+  # domains/harness.py
+  elif "genesis" in domain:
+      num_workers = 1  # forced
+      cfg = compose(
+          config_name="config",
+          overrides=[
+              f"eval.num_workers={num_workers}",
+              ...
+          ]
+      )
+  ```
+
+  This is because Genesis runs GPU-accelerated physics simulation that cannot safely be parallelized across threads.
+</Warning>
+
+## Hydra Configuration
+
+The config file is at `domains/genesis/config/config.yaml`. Key sections:
+
+```yaml
+envs:
+  names: "go2walking"
+  num_envs: 4096
+
+rl_trainer:
+  max_iterations: 101
+
+rl_eval:
+  max_steps: 1000  # 20 seconds at 0.02 s/step
+  record_video: False
+
+eval:
+  num_workers: 1
+  num_episodes:
+    go2walking: 6
+    go2walkback: 6
+    go2hop: 6
+```
+
+## Output Structure
+
+Outputs are written to `<output_dir>/<env_name>/<task_name>/` and include:
+
+- `chat_history_*.md` — agent conversation log
+- `rl_eval_<episode_idx>/` — evaluation results (JSON log, `eval_100.mp4` video)
+- `rl_train_<episode_idx>/` — training artifacts (model checkpoints `model_0.pt`, `model_100.pt`, TensorBoard events, config pickle)
+
+## Domain Properties
+
+| Property | Value |
+|---|---|
+| Score key | `average_fitness` |
+| Splits | `train` only |
+| Eval subset | full dataset |
+| Ensemble supported | No |
+| Staged eval samples | 3 out of 6 (50%) |
+| `num_workers` | Always 1 |

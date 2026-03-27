@@ -1,0 +1,68 @@
+---
+title: "Introduction"
+description: "HyperAgents: self-referential self-improving agents that can optimize for any computable task."
+---
+
+## What is HyperAgents?
+
+HyperAgents is a research system from Meta Research (arXiv:[2603.19461](https://arxiv.org/abs/2603.19461)) that implements **self-referential self-improvement** — a framework in which an AI agent iteratively rewrites and improves both itself and the agents it creates.
+
+Unlike conventional agent systems that apply a fixed policy, HyperAgents maintains an evolving population of agents. At each generation, a **meta-agent** inspects the current agent codebase and the performance history of all prior agents, then proposes code edits that get evaluated in an isolated Docker container. Improvements are retained in an **evolutionary archive** that tracks every generation, allowing the system to select the most promising lineages for continued improvement.
+
+## Core concepts
+
+**Meta-agent** — the outer loop agent that reads the repository, analyzes historical evaluation results, and writes code diffs to improve the task-agent or itself. Runs inside Docker to isolate model-generated code execution.
+
+**Task-agent** — the inner agent that is directly evaluated on a target domain (e.g., paper review, math olympiad, robotics). Its code lives in `task_agent.py` and is what the meta-agent modifies.
+
+**Evolutionary archive** — a graph structure (stored as `archive.jsonl`) that records every generated agent variant, its performance scores, and its lineage. Parent selection methods (`score_child_prop`, `score_prop`, `best`, `latest`, `random`) draw from this archive to seed the next generation.
+
+**Self-referential improvement** — the meta-agent is itself part of the repository it can edit (`meta_agent.py`). Over many generations it can therefore improve its own improvement strategy, closing the loop between the optimizer and the optimized.
+
+## Supported domains
+
+HyperAgents ships with harnesses for seven benchmark areas:
+
+| Domain | Description |
+|---|---|
+| `search_arena` | Web search and information retrieval |
+| `paper_review` | Scientific paper reviewing and scoring |
+| `balrog_babyai` / `babaisai` / `minihack` / `nle` | Text-based game environments (BALROG suite) |
+| `genesis_go2walking` / `go2walkback` / `go2hop` | Legged robot locomotion with Genesis physics |
+| `imo_grading` | International Math Olympiad answer grading |
+| `imo_proof` | Full proof generation and grading |
+| `polyglot` | Multi-language software engineering (SWE-bench style) |
+
+## Research context
+
+HyperAgents was developed by researchers at Meta AI Research, FAIR, and the University of Oxford. The accompanying paper is:
+
+> Zhang, J., Zhao, B., Yang, W., Foerster, J., Clune, J., Jiang, M., Devlin, S., & Shavrina, T. (2026). *Hyperagents*. arXiv:2603.19461.
+
+The project is licensed under [CC BY-NC-SA 4.0](https://github.com/facebookresearch/HyperAgents/blob/main/LICENSE.md) — non-commercial use only.
+
+<Warning>
+  HyperAgents executes model-generated code inside Docker containers. Read the [Safety](./safety) page before running any experiments.
+</Warning>
+
+## Explore the docs
+
+<CardGroup cols={2}>
+
+<Card title="Quickstart" icon="rocket" href="./quickstart">
+  Install dependencies, build the Docker image, and run your first evolution loop.
+</Card>
+
+<Card title="Safety" icon="shield" href="./safety">
+  Understand the risks of executing model-generated code and how Docker sandboxing helps.
+</Card>
+
+<Card title="Architecture" icon="diagram-project" href="./concepts/architecture">
+  Dive into the meta-agent / task-agent design, the evolutionary archive, and the generate loop.
+</Card>
+
+<Card title="Agent API" icon="code" href="./api/agent-system">
+  Reference for the LLM client, meta-agent, task-agent, and domain harness interfaces.
+</Card>
+
+</CardGroup>

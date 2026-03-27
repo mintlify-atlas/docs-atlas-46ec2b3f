@@ -1,0 +1,235 @@
+---
+title: "Task-Agent"
+description: "Deep dive into TaskAgent — the agent that solves domain tasks and whose code the meta-agent iteratively improves."
+---
+
+The `TaskAgent` is the workhorse that actually solves problems. It is the target of every meta-agent improvement cycle: each generation's `model_patch.diff` may change `task_agent.py` in any way — new tools, different prompts, chain-of-thought strategies, or entirely new architectures. Its performance on the evaluation dataset is the fitness signal that drives evolution.
+
+## Class Definition
+
+```python title="task_agent.py"
+from agent.base_agent import AgentSystem
+from agent.llm_withtools import chat_with_agent
+from utils.common import extract_jsons
+
+class TaskAgent(AgentSystem):
+    def forward(self, inputs):
+        """
+        An agent that solves a given task.
+
+        Args:
+            inputs (dict): A dictionary with input data for the task.
+
+        Returns:
+            tuple:
+                - prediction (str): The prediction made by the agent.
+                - new_msg_history (list): A list of messages representing the
+                  message history of the interaction.
+        """
+        domain = inputs['domain']
+        instruction = f"""You are an agent.
+
+Task input:
+```
+{inputs}
+```
+
+Respond in JSON format with the following schema:
+<json>
+{{
+    "response": ...
+}}
+</json>"""
+        new_msg_history = chat_with_agent(instruction, model=self.model, msg_history=[], logging=self.log)
+
+        # Extract the response
+        prediction = "None"
+        try:
+            extracted_jsons = extract_jsons(new_msg_history[-1]['text'])
+            if extracted_jsons is not None and "response" in extracted_jsons[-1]:
+                prediction = extracted_jsons[-1]['response']
+        except Exception as e:
+            self.log(f"Error extracting prediction: {e}")
+            prediction = "None"
+
+        return prediction, new_msg_history
+```
+
+## What `forward()` Does
+
+`forward()` takes a single `inputs` dict, builds an instruction string, calls the LLM, and extracts a JSON response.
+
+```python
+def forward(self, inputs: dict) -> tuple[str, list]
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `inputs` | `dict` | Domain-specific task data; must contain at least `"domain"` key |
+
+**Returns** a 2-tuple:
+
+| Return value | Type | Description |
+|---|---|---|
+| `prediction` | `str` | The extracted `response` value from the JSON output, or `"None"` on failure |
+| `new_msg_history` | `list` | Full LLM message history for the interaction (useful for debugging) |
+
+The baseline `TaskAgent` calls `chat_with_agent` **without tools** (`tools_available=[]` default), so the LLM reasons from its context window alone. The meta-agent can upgrade this to add tools, multi-turn reasoning, or external API calls.
+
+## JSON Response Schema
+
+The base prompt instructs the LLM to respond inside a `<json>` block:
+
+```json
+{
+    "response": "<the agent's answer to the task>"
+}
+```
+
+The extraction logic in `forward()` uses `extract_jsons` from `utils/common.py`, which scans `new_msg_history[-1]['text']` for `<json>...</json>` blocks and parses them. It takes the last valid JSON object that contains a `"response"` key. If parsing fails for any reason, `prediction` falls back to the string `"None"` and the error is logged — the harness continues running other samples.
+
+## Domain Input Dict Examples
+
+The exact shape of `inputs` is determined by each domain's `format_input_dict()` function in `domains/<domain>/utils.py`. The dict always contains at least `"domain"`. Typical examples:
+
+<Tabs>
+  <Tab title="search_arena">
+    ```python
+    {
+        "domain": "search_arena",
+        "question_id": "sa_042",
+        "query": "What are the best practices for container security?",
+        # ... additional domain-specific fields
+    }
+    ```
+  </Tab>
+  <Tab title="paper_review">
+    ```python
+    {
+        "domain": "paper_review",
+        "question_id": "pr_007",
+        "title": "Scaling Laws for Neural Language Models",
+        "abstract": "...",
+        "text": "...",
+        # ... additional domain-specific fields
+    }
+    ```
+  </Tab>
+  <Tab title="imo_grading">
+    ```python
+    {
+        "domain": "imo_grading",
+        "question_id": "imo_2023_p1",
+        "problem": "...",
+        "solution": "...",
+        # ... additional domain-specific fields
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+The `domain` key is read at the top of `forward()` but not actually used in the base implementation's instruction string — the entire `inputs` dict is embedded verbatim. Meta-agent improvements often use `domain` to branch into domain-specific prompting strategies.
+</Note>
+
+## How the Harness Loads and Runs TaskAgent
+
+The evaluation harness (`domains/harness.py`) dynamically imports `TaskAgent` and runs it in parallel across the dataset:
+
+<Steps>
+  <Step title="Dynamic import">
+    `load_task_agent(agent_path)` loads the agent from a file path (e.g. `./task_agent.py`) or a module string:
+
+    ```python title="domains/harness.py (load_task_agent)"
+    def load_task_agent(agent_path: str):
+        if agent_path.endswith(".py") or os.path.exists(agent_path):
+            abs_path = os.path.abspath(agent_path)
+            spec = importlib.util.spec_from_file_location("agent_module", abs_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.TaskAgent
+        # also supports module-path strings like "proofgrader.task_agent"
+        mod = importlib.import_module(agent_path)
+        return mod.TaskAgent
+    ```
+
+    This means the harness always loads the *current on-disk version* of `task_agent.py` — exactly what the meta-agent patched.
+  </Step>
+  <Step title="Per-sample worker">
+    Each dataset row is dispatched to a `ThreadPoolExecutor` worker:
+
+    ```python title="domains/harness.py (run_agent)"
+    def run_agent(TaskAgent, model, row, evals_folder, format_input_dict, question_id_col):
+        question_id = row[question_id_col]
+        chat_history_path = os.path.join(evals_folder, f"chat_history_{question_id}.md")
+        agent = TaskAgent(model=model, chat_history_file=chat_history_path)
+        inputs = format_input_dict(row)
+        prediction, _ = agent.forward(inputs)
+        return prediction
+    ```
+
+    A fresh `TaskAgent` instance is created for every sample (thread-safe by design).
+  </Step>
+  <Step title="Results saved">
+    Predictions are collected into a `predictions.csv`. The domain's `report.py` then computes domain-specific metrics and writes `report.json`, whose score key is read by `get_score()` during parent selection.
+  </Step>
+</Steps>
+
+## How the Meta-Agent Improves TaskAgent
+
+The meta-agent receives `repo_path` pointing at the live repo inside the Docker container. Using the `bash` and `editor` tools, it can make any change to `task_agent.py`. Common improvement patterns include:
+
+<Accordion title="Adding tools to the task-agent">
+  The baseline `TaskAgent` calls `chat_with_agent` with no tools. A meta-agent improvement might pass `tools_available='all'` or a specific list, enabling the task-agent to run bash commands or search the web during inference:
+
+  ```python
+  # Before (baseline)
+  new_msg_history = chat_with_agent(
+      instruction, model=self.model, msg_history=[], logging=self.log
+  )
+
+  # After (meta-agent improvement example)
+  new_msg_history = chat_with_agent(
+      instruction, model=self.model, msg_history=[], logging=self.log,
+      tools_available='all', max_tool_calls=20
+  )
+  ```
+</Accordion>
+
+<Accordion title="Changing the prompt strategy">
+  The meta-agent can rewrite the `instruction` string to use chain-of-thought, few-shot examples, domain-specific personas, or structured reasoning steps tailored to the domain type.
+</Accordion>
+
+<Accordion title="Changing the model">
+  `AgentSystem.__init__` accepts `model` from the harness utility module (`domains/<domain>/utils.py`). A meta-agent can change which model is used per domain or add model routing based on task difficulty.
+</Accordion>
+
+<Accordion title="Adding helper functions or modules">
+  The meta-agent can create entirely new Python files alongside `task_agent.py` and import them. For example, adding a retrieval module, a symbolic reasoning step, or a custom JSON parser.
+</Accordion>
+
+<Warning>
+The meta-agent **cannot** change domain evaluation code (`domains/`). `run_meta_agent.py` calls `reset_paths_to_commit(paths=["domains/"])` after the agent finishes, reverting any changes to that directory before the diff is saved.
+</Warning>
+
+## Compilation Verification
+
+Before evaluation runs, the loop verifies that the patched `task_agent.py` is importable:
+
+```python title="utils/gl_utils.py"
+command = ["python", "-c", "from task_agent import TaskAgent"]
+exec_result = container.exec_run(cmd=command, workdir=f"/{REPO_NAME}")
+if exec_result.exit_code != 0:
+    raise Exception("task_agent is not compilable")
+```
+
+If the import fails, `generate_loop.py` marks `run_eval=False` in the metadata and skips evaluation for that generation. The generation still gets added to the archive but is not a valid parent for future generations.
+
+<CardGroup cols={2}>
+  <Card title="Meta-Agent" icon="robot" href="/concepts/meta-agent">
+    The agent that modifies task_agent.py between generations.
+  </Card>
+  <Card title="Evolution Loop" icon="arrow-rotate-right" href="/concepts/evolution-loop">
+    How generations are orchestrated and scored.
+  </Card>
+</CardGroup>

@@ -1,97 +1,65 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "HyperAgents"
+description: "Self-referential self-improving agents that can optimize for any computable task"
 ---
 
-## Setting up
+HyperAgents is a research framework from Meta that implements a **self-referential self-improvement loop**: a meta-agent iteratively modifies the codebase — including its own agent implementations — to improve performance across diverse benchmark domains. Each generation, the system evaluates the evolved agents, selects the best-performing lineage, and uses it as the starting point for the next round of improvement.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install dependencies, configure API keys, and run your first evolution loop in minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Core Concepts" icon="brain" href="/concepts/architecture">
+    Understand the meta-agent, task-agent, and evolutionary archive design
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Domains" icon="grid" href="/domains/overview">
+    Explore the supported benchmark domains: paper review, games, robotics, math, and coding
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/agent-system">
+    Full reference for AgentSystem, MetaAgent, TaskAgent, and LLM utilities
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## How it works
 
-Everything you need to create world-class documentation.
+<Steps>
+  <Step title="Set up your environment">
+    Configure API keys for OpenAI, Anthropic, or Gemini models. Install Python dependencies and build the Docker container used for sandboxed evaluation.
+  </Step>
+  <Step title="Initialize agents">
+    Run `setup_initial.sh` to bootstrap initial agent evaluations on your chosen domain. This creates the baseline scores that the evolution loop will try to beat.
+  </Step>
+  <Step title="Run the evolution loop">
+    Launch `generate_loop.py` with your target domain. The meta-agent proposes code changes, the modified task agent is evaluated in Docker, and the archive is updated with the new generation.
+  </Step>
+  <Step title="Analyze results">
+    Inspect outputs in the `outputs/` directory. Use the built-in plotting utilities to visualize score progression and the evolutionary archive tree across generations.
+  </Step>
+</Steps>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Key capabilities
 
-## Need inspiration?
+<CardGroup cols={2}>
+  <Card title="Self-referential improvement" icon="arrows-rotate">
+    The meta-agent can modify any part of the codebase — including its own agent logic — enabling truly open-ended self-improvement
+  </Card>
+  <Card title="Multi-domain benchmarks" icon="trophy">
+    Evaluate across paper review, web search, BALROG games, Genesis robotics, IMO math, and SWE-bench coding
+  </Card>
+  <Card title="Safe sandboxed execution" icon="shield-halved">
+    All model-generated code runs inside isolated Docker containers to prevent accidental system damage
+  </Card>
+  <Card title="Archive-based selection" icon="sitemap">
+    Maintains a quality-diversity archive of all evolved agents; configurable parent selection strategies determine which lineage to evolve next
+  </Card>
+  <Card title="Multi-LLM support" icon="microchip">
+    Plug in GPT-4o, Claude, Gemini, or any LiteLLM-compatible model as the backbone for both meta and task agents
+  </Card>
+  <Card title="Ensemble scoring" icon="chart-bar">
+    Combine predictions from multiple evolved agents for stronger performance beyond any single agent generation
+  </Card>
+</CardGroup>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Warning>
+  HyperAgents executes untrusted, model-generated code. Always run it inside the provided Docker sandbox. See the [Safety](/safety) page for important guidance before running any experiments.
+</Warning>

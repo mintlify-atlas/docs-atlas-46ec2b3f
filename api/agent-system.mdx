@@ -1,0 +1,161 @@
+---
+title: "AgentSystem"
+description: "Abstract base class for all HyperAgents agents. Provides shared model configuration and thread-safe logging."
+---
+
+## Overview
+
+`AgentSystem` is the abstract base class that all agents in HyperAgents inherit from. It lives in `agent/base_agent.py` and provides two things every agent needs: a configured LLM model identifier and a thread-safe logger that writes conversation history to a markdown file.
+
+Both [`MetaAgent`](/api/meta-agent) and [`TaskAgent`](/api/task-agent) extend `AgentSystem` and implement its single abstract method, `forward`.
+
+## Source
+
+```python agent/base_agent.py
+from abc import ABC, abstractmethod
+from agent.llm import OPENAI_MODEL
+from utils.thread_logger import ThreadLoggerManager
+
+
+class AgentSystem(ABC):
+    def __init__(
+        self,
+        model=OPENAI_MODEL,
+        chat_history_file='./outputs/chat_history.md',
+    ):
+        self.model = model
+
+        # Initialize logger and store it in thread-local storage
+        self.logger_manager = ThreadLoggerManager(log_file=chat_history_file)
+        self.log = self.logger_manager.log
+
+        # Clear the log file
+        with open(chat_history_file, 'w') as f:
+            f.write('')
+
+    @abstractmethod
+    def forward(self, *args, **kwargs):
+        pass
+```
+
+## Constructor
+
+```python
+AgentSystem(model=OPENAI_MODEL, chat_history_file='./outputs/chat_history.md')
+```
+
+<ParamField path="model" type="str" default="openai/gpt-4o">
+  The LLM model identifier passed to [LiteLLM](https://docs.litellm.ai/). Uses the
+  `provider/model-name` format. The default constant `OPENAI_MODEL` resolves to
+  `"openai/gpt-4o"`.
+
+  <Expandable title="Available model constants (agent/llm.py)">
+    | Constant | Value |
+    |---|---|
+    | `OPENAI_MODEL` | `"openai/gpt-4o"` |
+    | `OPENAI_MINI_MODEL` | `"openai/gpt-4o-mini"` |
+    | `OPENAI_O3_MODEL` | `"openai/o3"` |
+    | `OPENAI_O3MINI_MODEL` | `"openai/o3-mini"` |
+    | `OPENAI_O4MINI_MODEL` | `"openai/o4-mini"` |
+    | `OPENAI_GPT52_MODEL` | `"openai/gpt-5.2"` |
+    | `OPENAI_GPT5_MODEL` | `"openai/gpt-5"` |
+    | `OPENAI_GPT5MINI_MODEL` | `"openai/gpt-5-mini"` |
+    | `CLAUDE_MODEL` | `"anthropic/claude-sonnet-4-5-20250929"` |
+    | `CLAUDE_HAIKU_MODEL` | `"anthropic/claude-3-haiku-20240307"` |
+    | `CLAUDE_35NEW_MODEL` | `"anthropic/claude-3-5-sonnet-20241022"` |
+    | `GEMINI_3_MODEL` | `"gemini/gemini-3-pro-preview"` |
+    | `GEMINI_MODEL` | `"gemini/gemini-2.5-pro"` |
+    | `GEMINI_FLASH_MODEL` | `"gemini/gemini-2.5-flash"` |
+  </Expandable>
+</ParamField>
+
+<ParamField path="chat_history_file" type="str" default="./outputs/chat_history.md">
+  Path to the file where the full conversation history (all LLM inputs and
+  outputs) will be written. The file is **cleared on every instantiation** — each
+  agent run starts with a fresh log. The parent directory is created automatically
+  by `ThreadLoggerManager` if it does not exist.
+</ParamField>
+
+## Instance Attributes
+
+| Attribute | Type | Description |
+|---|---|---|
+| `self.model` | `str` | The model identifier string passed to the constructor. |
+| `self.logger_manager` | `ThreadLoggerManager` | The logger manager instance. Keyed internally by `(thread_id, log_file)` so multiple agents running in threads write to separate files without locking. |
+| `self.log` | `callable` | Shortcut to `self.logger_manager.log(message, level=logging.INFO)`. Call this inside `forward` to record any string to the chat history file. |
+
+## Abstract Method
+
+```python
+@abstractmethod
+def forward(self, *args, **kwargs):
+    pass
+```
+
+Every subclass **must** implement `forward`. The signature is unconstrained at the base class level — concrete agents define their own parameter lists. Calling `AgentSystem()` directly or subclassing without implementing `forward` raises `TypeError`.
+
+## ThreadLoggerManager
+
+`ThreadLoggerManager` (in `utils/thread_logger.py`) wraps Python's standard `logging` module with thread-safety. It is used internally by `AgentSystem` but can also be used standalone.
+
+```python utils/thread_logger.py
+class ThreadLoggerManager:
+    _loggers = {}
+    _lock = threading.Lock()
+
+    def __init__(self, log_file='./chat_history.md', level=logging.INFO):
+        ...
+
+    def get_logger(self):
+        """Get or create a logger specific to (thread_id, log_file)."""
+        ...
+
+    def log(self, message, level=logging.INFO):
+        logger = self.get_logger()
+        logger.log(level, message)
+```
+
+Key implementation details:
+
+- Loggers are stored in a class-level dict keyed by `(thread_id, log_file)`. A `ThreadPoolExecutor` running five `TaskAgent` instances will therefore produce five independent log files with no interleaving.
+- The underlying `RotatingFileHandler` caps each file at **10 MB** with up to 5 rotating backups.
+- Log entries are written with the format string `'%(message)s'` — just the bare message, no timestamps or level prefixes — which keeps the chat history files human-readable as markdown.
+
+## Subclassing Pattern
+
+The pattern used throughout HyperAgents is to override only `forward` and delegate all LLM calls to `chat_with_agent`, passing `self.model` and `self.log`:
+
+```python
+from agent.base_agent import AgentSystem
+from agent.llm_withtools import chat_with_agent
+
+class MyAgent(AgentSystem):
+    def forward(self, inputs):
+        instruction = f"Do something with: {inputs}"
+        new_msg_history = chat_with_agent(
+            instruction,
+            model=self.model,
+            msg_history=[],
+            logging=self.log,
+        )
+        return new_msg_history
+```
+
+The constructor is inherited as-is. Instantiate your agent with:
+
+```python
+from agent.llm import CLAUDE_MODEL
+
+agent = MyAgent(
+    model=CLAUDE_MODEL,
+    chat_history_file="./outputs/my_agent_chat.md",
+)
+agent.forward(inputs)
+```
+
+<Note>
+  `AgentSystem.__init__` opens `chat_history_file` in write mode (`'w'`) every
+  time a new instance is created, which truncates any existing content. If you
+  need to preserve logs across runs, copy the file before creating a new agent
+  instance.
+</Note>

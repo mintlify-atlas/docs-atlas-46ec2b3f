@@ -1,0 +1,212 @@
+---
+title: "Meta-Agent"
+description: "Deep dive into MetaAgent — the self-improving agent that edits the HyperAgents codebase between generations."
+---
+
+The `MetaAgent` is the engine of self-improvement. Its only job is to look at the current state of the codebase and the scores from previous generations, then decide what to change. The changes it makes are what the next generation's `TaskAgent` inherits.
+
+## Class Definition
+
+```python title="meta_agent.py"
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+
+from agent.base_agent import AgentSystem
+from agent.llm_withtools import chat_with_agent
+
+class MetaAgent(AgentSystem):
+    def forward(self, repo_path, eval_path, iterations_left=None):
+        """
+        A meta agent that recursively self-improves.
+
+        Args:
+            repo_path (str): The path to the repository.
+            eval_path (str): The path to previously generated agents and their evaluation results.
+            iterations_left (int, optional): The number of remaining iterations in which the meta agent will be invoked in future. Defaults to None.
+        """
+        instruction = f"Modify any part of the codebase at `{repo_path}`."
+
+        new_msg_history = chat_with_agent(instruction, model=self.model, msg_history=[], logging=self.log, tools_available='all')
+```
+
+`MetaAgent` extends `AgentSystem`, which provides:
+- `self.model` — the LLM identifier (defaults to `OPENAI_MODEL = "openai/gpt-4o"`).
+- `self.log` — a thread-safe logger backed by `ThreadLoggerManager` that writes to a markdown chat-history file.
+
+## What `forward()` Does
+
+`forward()` constructs a single instruction string and hands it to `chat_with_agent`. The function signature is:
+
+```python
+def forward(self, repo_path, eval_path, iterations_left=None)
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `repo_path` | `str` | Absolute path to the repository root inside the Docker container (e.g. `/HyperAgents/`) |
+| `eval_path` | `str` | Path containing prior generations' evaluation results; the meta-agent reads scores from here |
+| `iterations_left` | `int \| None` | Number of future meta-agent invocations remaining; passed so the agent can plan horizon-aware changes |
+
+The instruction is intentionally minimal — `"Modify any part of the codebase at `{repo_path}`."`  — so that the meta-agent has maximum freedom to decide what to change: it may edit `task_agent.py`, introduce helper modules, change prompts, or even modify its own loop logic.
+
+<Note>
+`eval_path` is passed to the meta-agent as context via the instruction string that `run_meta_agent.py` builds, not directly inside `MetaAgent.forward`. The `forward` method itself only surfaces `repo_path` in the instruction, while `run_meta_agent.py` passes `eval_path` as `--evals_folder` and the meta-agent can access it via bash tools.
+</Note>
+
+## Tools Available to the Meta-Agent
+
+`chat_with_agent` is called with `tools_available='all'`, which loads every module in `agent/tools/`. Two tools are currently available:
+
+<Tabs>
+  <Tab title="bash">
+    Defined in `agent/tools/bash.py`. Runs arbitrary shell commands in a persistent `BashSession`.
+
+    ```json
+    {
+      "tool_name": "bash",
+      "tool_input": {
+        "command": "cat /HyperAgents/task_agent.py"
+      }
+    }
+    ```
+
+    Key characteristics:
+    - State is **persistent** across calls within a single `forward()` invocation (same bash process).
+    - 120-second timeout per command.
+    - No internet access inside the Docker sandbox.
+    - Supports background processes (`sleep 10 &`) and `apt`/`pip` installs via local mirrors.
+  </Tab>
+  <Tab title="editor">
+    Defined in `agent/tools/edit.py`. A structured file editor — no raw `sed` gymnastics required.
+
+    ```json
+    {
+      "tool_name": "editor",
+      "tool_input": {
+        "command": "str_replace",
+        "path": "/HyperAgents/task_agent.py",
+        "old_str": "    instruction = f\"You are an agent.\"",
+        "new_str": "    instruction = f\"You are an expert reasoning agent.\""
+      }
+    }
+    ```
+
+    Supported commands:
+    | Command | Description |
+    |---|---|
+    | `view` | `cat -n` on a file, or `find -maxdepth 2` on a directory |
+    | `create` | Create a new file (fails if the file already exists) |
+    | `str_replace` | Exact-string replacement; must be unique in the file |
+    | `insert` | Insert lines after a given line number |
+    | `undo_edit` | Revert the last edit to a file |
+  </Tab>
+</Tabs>
+
+The tool-use protocol is plain JSON wrapped in `<json>...</json>` tags. The loop in `chat_with_agent` continues calling the LLM until no tool call is found in the response, or until `max_tool_calls=40` is reached.
+
+## Model Defaults and Overrides
+
+`AgentSystem.__init__` sets `self.model` from `agent/llm.py`:
+
+```python title="agent/base_agent.py"
+from agent.llm import OPENAI_MODEL
+
+class AgentSystem(ABC):
+    def __init__(
+        self,
+        model=OPENAI_MODEL,          # "openai/gpt-4o" (AgentSystem base default)
+        chat_history_file='./outputs/chat_history.md',
+    ):
+        self.model = model
+```
+
+<Note>
+`run_meta_agent.py` overrides this base default: its `--model` argument defaults to `CLAUDE_MODEL = "anthropic/claude-sonnet-4-5-20250929"`. In practice, when the meta-agent is invoked via `generate_loop.py`, the effective default model is Claude unless `--model` is explicitly passed.
+</Note>
+
+The full list of named model constants in `agent/llm.py`:
+
+```python title="agent/llm.py"
+CLAUDE_MODEL          = "anthropic/claude-sonnet-4-5-20250929"   # run_meta_agent.py default
+CLAUDE_HAIKU_MODEL    = "anthropic/claude-3-haiku-20240307"
+CLAUDE_35NEW_MODEL    = "anthropic/claude-3-5-sonnet-20241022"
+OPENAI_MODEL          = "openai/gpt-4o"            # AgentSystem base default
+OPENAI_MINI_MODEL     = "openai/gpt-4o-mini"
+OPENAI_O3_MODEL       = "openai/o3"
+OPENAI_O3MINI_MODEL   = "openai/o3-mini"
+OPENAI_O4MINI_MODEL   = "openai/o4-mini"
+OPENAI_GPT52_MODEL    = "openai/gpt-5.2"
+OPENAI_GPT5_MODEL     = "openai/gpt-5"
+OPENAI_GPT5MINI_MODEL = "openai/gpt-5-mini"
+GEMINI_3_MODEL        = "gemini/gemini-3-pro-preview"
+GEMINI_MODEL          = "gemini/gemini-2.5-pro"
+GEMINI_FLASH_MODEL    = "gemini/gemini-2.5-flash"
+```
+
+All models are routed through [LiteLLM](https://docs.litellm.ai), so any provider string LiteLLM understands works. The `generate_loop` CLI passes `--model` through to `run_meta_agent.py`, which passes it to the `MetaAgent` constructor.
+
+<Tip>
+For the `polyglot` domain, `generate_loop.py` hard-codes `claude-3-5-sonnet-20241022` as the meta-agent model to maintain a fair comparison with the DGM baseline. Override this by forking the domain-specific logic in `generate_loop.py:588`.
+</Tip>
+
+## How `run_meta_agent.py` Invokes MetaAgent
+
+`run_meta_agent.py` is the entry point called inside the Docker container:
+
+```python title="run_meta_agent.py"
+def main():
+    # ... argument parsing ...
+
+    # Instantiate the agent with model and log file
+    meta_agent = MetaAgent(
+        model=args.model,
+        chat_history_file=args.chat_history_file,
+    )
+    meta_agent.forward(
+        repo_path=args.repo_path,
+        eval_path=args.evals_folder,
+        iterations_left=args.iterations_left,
+    )
+
+    # Strip changes to domain code — evaluation harness must not be altered
+    reset_paths_to_commit(
+        git_dname=args.git_dir, commit=args.base_commit, paths=["domains/"]
+    )
+
+    # Capture the diff and write model_patch.diff
+    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+    with open(os.path.join(args.outdir, "model_patch.diff"), "w") as f:
+        f.write(model_patch)
+```
+
+<Steps>
+  <Step title="Run the meta-agent">
+    `MetaAgent.forward()` is called. The LLM uses bash and editor tools freely for up to 6 hours (container timeout).
+  </Step>
+  <Step title="Reset domain code">
+    `reset_paths_to_commit(paths=["domains/"])` uses `git checkout` to undo any changes the meta-agent made inside `domains/`. This keeps the evaluation harness stable across generations.
+  </Step>
+  <Step title="Save the diff">
+    `diff_versus_commit(git_dir, base_commit)` runs `git diff` against the pre-run commit hash and writes the result to `agent_output/model_patch.diff`. An empty file means the agent made no changes; `generate_loop.py` will skip evaluation in that case.
+  </Step>
+</Steps>
+
+## Compilation Check
+
+After `run_meta_agent.py` exits, `generate_loop.py` runs a quick sanity check before proceeding to evaluation:
+
+```python title="utils/gl_utils.py (run_commands_to_check_compilation)"
+command = ["python", "-c", "from meta_agent import MetaAgent"]
+# and
+command = ["python", "-c", "from task_agent import TaskAgent"]
+```
+
+If either import fails (exit code ≠ 0), a `RuntimeError` is raised and the generation is marked as having no valid evaluation result.
+
+<CardGroup cols={2}>
+  <Card title="Task-Agent" icon="code" href="/concepts/task-agent">
+    What the meta-agent is ultimately trying to improve.
+  </Card>
+  <Card title="Evolution Loop" icon="arrow-rotate-right" href="/concepts/evolution-loop">
+    How the generate loop orchestrates meta-agent invocations.
+  </Card>
+</CardGroup>

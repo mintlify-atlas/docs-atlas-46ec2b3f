@@ -1,0 +1,313 @@
+---
+title: "Generate Loop Reference"
+description: "Complete CLI reference for generate_loop.py, the main entry point for running the HyperAgents self-improvement algorithm."
+---
+
+## Overview
+
+`generate_loop.py` is the main entry point for HyperAgents. It orchestrates the full evolutionary loop: selecting a parent generation, running the meta-agent inside a Docker container to produce a diff, evaluating the resulting agent, updating the archive, and repeating.
+
+```bash
+python generate_loop.py --domains <domain> [options]
+```
+
+Outputs are written to `outputs/generate_<timestamp>/` by default.
+
+---
+
+## Arguments
+
+### `--run_id`
+
+<ParamField path="run_id" type="string" default="null (auto-generated)">
+  A string identifier for this run. If not provided, a timestamp-based ID is generated automatically (`YYYYMMDD_HHMMSS_ffffff`). The run ID becomes the suffix of the output directory name: `outputs/generate_<run_id>/`.
+</ParamField>
+
+---
+
+### `--domains` _(required)_
+
+<ParamField path="domains" type="string[]" required>
+  One or more domains to run. All listed domains are evaluated jointly in each generation. Accepted values:
+
+  - `search_arena`
+  - `paper_review`
+  - `balrog_babyai`
+  - `balrog_babaisai`
+  - `balrog_minihack`
+  - `balrog_nle`
+  - `genesis_go2walking`
+  - `genesis_go2walkback`
+  - `genesis_go2hop`
+  - `polyglot`
+  - `imo_grading`
+  - `imo_proof`
+</ParamField>
+
+<Note>
+  `polyglot` uses a separate evaluation harness from all other domains and is handled specially inside `generate_loop.py`. When `polyglot` is included alongside other domains, the other domains run through the standard `domains.harness` path while `polyglot` runs through its own two-stage evaluation.
+</Note>
+
+---
+
+### `--max_generation`
+
+<ParamField path="max_generation" type="integer" default="10">
+  Total number of evolution generations to run. The loop runs generations `start` through `max_generation` inclusive, where `start` is determined by the current archive size (0 on a fresh run, or the resume point when using `--resume_from`).
+</ParamField>
+
+---
+
+### `--eval_samples`
+
+<ParamField path="eval_samples" type="integer[]" default="-1 (all samples)">
+  Number of evaluation samples per domain. Provide one integer per domain listed in `--domains` in the same order. Use `-1` to evaluate on all available samples for that domain.
+
+  ```bash
+  # Evaluate 50 samples on search_arena and all samples on paper_review
+  python generate_loop.py --domains search_arena paper_review --eval_samples 50 -1
+  ```
+</ParamField>
+
+---
+
+### `--eval_workers`
+
+<ParamField path="eval_workers" type="integer" default="10">
+  Number of parallel workers used when running evaluation inside the container. Higher values speed up evaluation but require more CPU and memory.
+</ParamField>
+
+---
+
+### `--parent_selection`
+
+<ParamField path="parent_selection" type="string" default="score_child_prop">
+  Strategy for selecting which archived generation to use as the parent for the next generation.
+
+  | Value | Description |
+  |---|---|
+  | `random` | Pick any valid parent uniformly at random |
+  | `latest` | Always use the most recent valid generation |
+  | `best` | Use the highest-scoring generation in the archive |
+  | `score_prop` | Sample proportionally to each node's own score |
+  | `score_child_prop` | Sample proportionally to the best score among a node's children (default) |
+
+  <Note>
+    When `--run_baseline no_archive` is set, this argument is ignored and `latest` is used automatically, since the no-archive baseline always continues from the most recent generation.
+  </Note>
+</ParamField>
+
+---
+
+### `--resume_from`
+
+<ParamField path="resume_from" type="string">
+  Path to an existing output directory (`outputs/generate_<run_id>/`) to resume an interrupted run. The loop reads the existing archive and continues from where it left off.
+
+  ```bash
+  python generate_loop.py --domains search_arena --resume_from outputs/generate_20240101_120000_000000
+  ```
+</ParamField>
+
+---
+
+### `--output_dir_parent`
+
+<ParamField path="output_dir_parent" type="string" default="./outputs/">
+  Parent directory under which the new run's output folder is created. Defaults to `outputs/` relative to the working directory. The actual output directory will be `<output_dir_parent>/generate_<run_id>/`.
+</ParamField>
+
+---
+
+### `--meta_patch_files`
+
+<ParamField path="meta_patch_files" type="string[]">
+  One or more `.diff` patch files to apply to the repository before starting the evolution loop. These patches define the initial state of the agent before any meta-agent improvements. If not provided, the run starts from the unmodified repository.
+</ParamField>
+
+---
+
+### `--reset_task_agent`
+
+<ParamField path="reset_task_agent" type="boolean" default="false">
+  When set, changes to the task agent from `--meta_patch_files` are reset so that the task agent starts from its original form. Used for self-referential self-improvement transfer experiments where you want to apply a pre-evolved meta-agent but keep the task agent at its baseline.
+</ParamField>
+
+---
+
+### `--reset_meta_agent`
+
+<ParamField path="reset_meta_agent" type="boolean" default="false">
+  When set, changes to the meta-agent from `--meta_patch_files` are reset. Used in combination with `--reset_task_agent` for transfer experiments.
+</ParamField>
+
+---
+
+### `--copy_root_dir`
+
+<ParamField path="copy_root_dir" type="string">
+  Path to a directory to use as the root repository state instead of the current working directory. Useful when comparing runs that need to start from the exact same initial commit.
+</ParamField>
+
+---
+
+### `--run_baseline`
+
+<ParamField path="run_baseline" type="string">
+  Run one of the comparison baselines instead of the default HyperAgents algorithm. See [Baselines](/configuration/baselines) for full details.
+
+  | Value | Description |
+  |---|---|
+  | `no_selfimprove` | No meta-agent improvement; static task agent |
+  | `no_archive` | Linear chain — only latest generation used as parent |
+  | `dgm` | DGM coding agent as meta-agent |
+  | `dgm_custom` | DGM with a custom problem statement |
+  | `dgm+no_selfimprove` | DGM meta-agent with a static underlying agent |
+  | `dgm_custom+no_selfimprove` | DGM custom + static underlying agent |
+</ParamField>
+
+---
+
+### `--optimize_option`
+
+<ParamField path="optimize_option" type="string" default="only_agent">
+  Controls which components of the system the meta-agent is allowed to optimize.
+
+  | Value | Description |
+  |---|---|
+  | `only_agent` | Optimize only the task agent code (default) |
+  | `only_ensemble` | Optimize only the ensemble selection mechanism; requires `--agent_archive_path` |
+  | `both_agent_ensemble` | Optimize both the task agent and the ensemble mechanism |
+</ParamField>
+
+---
+
+### `--agent_archive_path`
+
+<ParamField path="agent_archive_path" type="string">
+  Path to an existing agent archive directory. Required when `--optimize_option only_ensemble` is used — the ensemble optimizer needs a pre-existing set of agents to combine.
+
+  ```bash
+  python generate_loop.py --domains search_arena \
+    --optimize_option only_ensemble \
+    --agent_archive_path outputs/generate_20240101_120000_000000
+  ```
+</ParamField>
+
+---
+
+### `--eval_test`
+
+<ParamField path="eval_test" type="boolean" default="false">
+  When set, evaluation is also run on the held-out test split in addition to the training split. By default only the train split is evaluated during the evolution loop to avoid test-set leakage.
+</ParamField>
+
+---
+
+### `--skip_staged_eval`
+
+<ParamField path="skip_staged_eval" type="boolean" default="false">
+  Skip the staged (small-sample) evaluation gate. By default, each generation first evaluates on a small subset of problems before running full evaluation. If the agent scores 0 on the small subset, full evaluation is skipped. Setting this flag bypasses that gate and always runs full evaluation.
+
+  <Tip>
+    Use `--skip_staged_eval` during debugging or when you want deterministic evaluation regardless of intermediate scores.
+  </Tip>
+</ParamField>
+
+---
+
+### `--edit_select_parent`
+
+<ParamField path="edit_select_parent" type="boolean" default="false">
+  Allow the meta-agent to modify the parent selection mechanism itself. When enabled, parent selection runs inside a Docker container via `utils.run_select_next_parent` instead of being computed on the host. This is part of the fully self-referential setting described in the paper.
+</ParamField>
+
+---
+
+## Usage Examples
+
+<CodeGroup>
+
+```bash Single Domain
+# Run HyperAgents on search_arena for 10 generations
+python generate_loop.py --domains search_arena
+```
+
+```bash Multi-Domain
+# Run jointly on search_arena and paper_review
+python generate_loop.py \
+  --domains search_arena paper_review \
+  --eval_samples 100 50 \
+  --max_generation 15
+```
+
+```bash Resume from Checkpoint
+# Resume an interrupted run
+python generate_loop.py \
+  --domains search_arena \
+  --resume_from outputs/generate_20240101_120000_000000
+```
+
+```bash With Baseline
+# Run the no_archive baseline for comparison
+python generate_loop.py \
+  --domains search_arena \
+  --run_baseline no_archive \
+  --max_generation 10
+```
+
+```bash Ensemble Mode
+# Optimize the ensemble mechanism using a pre-existing agent archive
+python generate_loop.py \
+  --domains search_arena \
+  --optimize_option only_ensemble \
+  --agent_archive_path outputs/generate_20240101_120000_000000 \
+  --max_generation 5
+```
+
+```bash Custom Output Directory
+# Write outputs to a specific parent directory
+python generate_loop.py \
+  --domains balrog_babyai \
+  --output_dir_parent /scratch/experiments/ \
+  --max_generation 20 \
+  --eval_workers 20
+```
+
+```bash Full Evaluation with Test Set
+# Run with staged eval disabled and test set evaluation enabled
+python generate_loop.py \
+  --domains paper_review \
+  --eval_test \
+  --skip_staged_eval \
+  --max_generation 10
+```
+
+</CodeGroup>
+
+---
+
+## Output Structure
+
+Each run produces a directory under `outputs/`:
+
+```
+outputs/
+└── generate_<run_id>/
+    ├── archive.jsonl              # Archive state after each generation
+    ├── generate_loop.log          # Argument log for reproducibility
+    ├── select_next_parent.log     # Parent selection log (if --edit_select_parent)
+    ├── gen_initial/               # Baseline evaluation of the starting agent
+    ├── gen_0/                     # Generation 0 (if meta_patch_files provided)
+    │   ├── metadata.json
+    │   ├── generate.log
+    │   ├── agent_output/
+    │   │   ├── model_patch.diff
+    │   │   └── meta_agent_chat_history.md
+    │   └── <domain>_eval/
+    ├── gen_1/
+    │   └── ...
+    └── gen_N/
+```
+
+The `archive.jsonl` file records the full lineage graph and scores for all generations and is used by the parent selection algorithm in subsequent runs.

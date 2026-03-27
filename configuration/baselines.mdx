@@ -1,0 +1,173 @@
+---
+title: "Baselines"
+description: "Reference for the comparison baselines available via --run_baseline in generate_loop.py."
+---
+
+## Overview
+
+The `--run_baseline` argument in `generate_loop.py` lets you run controlled comparison experiments against the default HyperAgents algorithm. Each baseline ablates or replaces a specific component of the system, making it possible to measure the contribution of the meta-agent, the archive, and the self-improvement mechanism independently.
+
+<Note>
+  When no `--run_baseline` is specified, HyperAgents runs in its default configuration: a meta-agent that improves the task agent over multiple generations, selecting parents from a scored archive using `score_child_prop`.
+</Note>
+
+---
+
+## Baseline Reference
+
+### `no_selfimprove`
+
+The meta-agent runs but its modifications are applied to a copy of the repository (`/DONOTTOUCH_hyperagents`), not to the live agent. The task agent that gets evaluated each generation is always the static baseline agent — the meta-agent cannot make permanent improvements to it.
+
+**What it tests:** Whether the archive and parent selection mechanism alone contribute to performance, independent of actual agent improvement.
+
+**When to use it:** As the strongest ablation of self-improvement. If HyperAgents does not outperform `no_selfimprove`, the meta-agent's code changes are not actually beneficial.
+
+---
+
+### `no_archive`
+
+The evolutionary archive is disabled. Instead of selecting parents from the full history of generations, the loop always uses the **most recent** generation as the parent (equivalent to forcing `--parent_selection latest`). This turns the branching archive into a simple linear chain.
+
+**What it tests:** The value of maintaining and searching the archive versus simple sequential improvement.
+
+**When to use it:** To isolate the benefit of the archive structure. A result where HyperAgents outperforms `no_archive` demonstrates that the archive enables discovery of better improvement trajectories.
+
+<Note>
+  When `--run_baseline no_archive` is active, the `--parent_selection` argument is ignored. Parent selection is automatically set to `latest`.
+</Note>
+
+---
+
+### `dgm`
+
+Replaces the HyperAgents meta-agent (`run_meta_agent.py`) with the **DGM (Darwin Gödel Machine)** coding agent (`baselines/dgm/coding_agent.py`). The DGM agent receives a problem statement derived from the current domain and evaluation results, then produces a code diff in the same way as the HyperAgents meta-agent.
+
+The rest of the framework — archive, parent selection, evaluation harness, Docker containers — remains the same as the default HyperAgents run.
+
+**What it tests:** Whether the HyperAgents meta-agent design outperforms the DGM coding agent within the same evolutionary framework.
+
+**When to use it:** For a direct comparison with DGM as described in the HyperAgents paper.
+
+<Note>
+  For the `polyglot` domain, the HyperAgents default run already uses `claude-3-5-sonnet-20241022` to match the DGM comparison setup.
+</Note>
+
+---
+
+### `dgm_custom`
+
+Identical to `dgm`, except the problem statement passed to the DGM coding agent is **customized** per domain. The `get_problem_statement` utility generates a domain-specific prompt rather than a generic one.
+
+**What it tests:** DGM performance when given more targeted guidance about what to improve.
+
+**When to use it:** When you want to give DGM the strongest possible starting point for comparison.
+
+---
+
+### `dgm+no_selfimprove`
+
+Combines the DGM meta-agent with the `no_selfimprove` constraint: the DGM agent runs but its changes are applied to a copy of the repository, not the live agent. The task agent evaluated each generation is static.
+
+**What it tests:** DGM acting purely as a meta-agent that cannot persistently improve the underlying task agent — a maximally conservative comparison.
+
+**When to use it:** To establish a lower bound on what DGM can contribute when its output never accumulates.
+
+---
+
+### `dgm_custom+no_selfimprove`
+
+Same as `dgm+no_selfimprove` but with the custom problem statement variant.
+
+**What it tests:** Same as `dgm+no_selfimprove` but with better-guided DGM prompts.
+
+---
+
+## Comparison Summary
+
+| Baseline | Meta-agent | Archive | Self-improvement |
+|---|---|---|---|
+| _(default)_ | HyperAgents | Full archive | Yes |
+| `no_selfimprove` | HyperAgents | Full archive | **No** |
+| `no_archive` | HyperAgents | **Latest only** | Yes |
+| `dgm` | **DGM** | Full archive | Yes |
+| `dgm_custom` | **DGM (custom prompt)** | Full archive | Yes |
+| `dgm+no_selfimprove` | **DGM** | Full archive | **No** |
+| `dgm_custom+no_selfimprove` | **DGM (custom prompt)** | Full archive | **No** |
+
+---
+
+## Example Commands
+
+<CodeGroup>
+
+```bash no_selfimprove
+# Ablate self-improvement: meta-agent runs but cannot modify the task agent
+python generate_loop.py \
+  --domains search_arena \
+  --run_baseline no_selfimprove \
+  --max_generation 10
+```
+
+```bash no_archive
+# Ablate the archive: linear chain improvement only
+python generate_loop.py \
+  --domains search_arena \
+  --run_baseline no_archive \
+  --max_generation 10
+```
+
+```bash dgm
+# Use DGM coding agent as the meta-agent
+python generate_loop.py \
+  --domains search_arena \
+  --run_baseline dgm \
+  --max_generation 10
+```
+
+```bash dgm_custom
+# Use DGM with a domain-specific problem statement
+python generate_loop.py \
+  --domains search_arena \
+  --run_baseline dgm_custom \
+  --max_generation 10
+```
+
+```bash dgm+no_selfimprove
+# DGM runs but cannot persistently improve the task agent
+python generate_loop.py \
+  --domains search_arena \
+  --run_baseline "dgm+no_selfimprove" \
+  --max_generation 10
+```
+
+```bash dgm_custom+no_selfimprove
+# DGM with custom prompt, no persistent self-improvement
+python generate_loop.py \
+  --domains search_arena \
+  --run_baseline "dgm_custom+no_selfimprove" \
+  --max_generation 10
+```
+
+</CodeGroup>
+
+---
+
+## Running Multiple Baselines for Comparison
+
+To produce a clean comparison across baselines, run each with the same `--max_generation` and `--eval_samples` settings and point outputs to a shared parent directory:
+
+```bash
+OUTDIR=/scratch/experiments/comparison
+
+python generate_loop.py --domains search_arena --output_dir_parent $OUTDIR/default     --max_generation 10
+python generate_loop.py --domains search_arena --output_dir_parent $OUTDIR/no_selfimprove --run_baseline no_selfimprove --max_generation 10
+python generate_loop.py --domains search_arena --output_dir_parent $OUTDIR/no_archive  --run_baseline no_archive  --max_generation 10
+python generate_loop.py --domains search_arena --output_dir_parent $OUTDIR/dgm         --run_baseline dgm         --max_generation 10
+```
+
+The `analysis/plot_progress.py` and `analysis/visualize_archive.py` scripts can then be run across the output directories to produce comparison plots.
+
+<Warning>
+  Each baseline run starts a fresh Docker container per generation and runs a full meta-agent + evaluation cycle. Running all baselines in parallel requires substantial compute — plan for at least 6 hours per generation per baseline (meta-agent timeout) plus up to 5 hours for evaluation.
+</Warning>

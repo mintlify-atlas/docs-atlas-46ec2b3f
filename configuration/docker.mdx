@@ -1,0 +1,165 @@
+---
+title: "Docker Configuration"
+description: "Understand how HyperAgents builds and manages Docker containers for sandboxed agent generation and evaluation."
+---
+
+## Overview
+
+Every generation in HyperAgents runs inside a fresh Docker container. Isolation ensures that model-generated code changes cannot affect the host environment or bleed between generations. The container lifecycle follows a fixed sequence for each generation:
+
+1. **Build** — create a named container from the `hyperagents` image
+2. **Start** — bring the container up with host networking and a repo volume mount
+3. **Apply patches** — replay the parent's lineage of `.diff` files inside the container
+4. **Run meta-agent** — execute `run_meta_agent.py` (or the DGM coding agent) to produce a new diff
+5. **Evaluate** — run `domains.harness` against the patched agent inside the container
+6. **Copy results** — pull evaluation outputs and the new diff back to the host
+7. **Reset** — `git reset --hard` + `git clean -fd` to restore the repo to the root commit
+8. **Cleanup** — stop and remove the container
+
+---
+
+## Base Image
+
+The Dockerfile is based on `nvidia/cuda:13.0.0-devel-ubuntu22.04`, providing CUDA 13.0 support for the Genesis robotics domain.
+
+```dockerfile
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04
+```
+
+Key environment variables set at build time:
+
+| Variable | Value | Purpose |
+|---|---|---|
+| `LD_LIBRARY_PATH` | `/usr/local/cuda/lib64:...` | CUDA and NVIDIA library resolution |
+| `DEBIAN_FRONTEND` | `noninteractive` | Suppress apt prompts |
+| `TZ` | `America/Los_Angeles` | Timezone for reproducibility |
+| `PYOPENGL_PLATFORM` | `egl` | Headless OpenGL for rendering |
+| `DISPLAY` | `:99` | Virtual display for environments that need one |
+
+---
+
+## What Gets Installed
+
+The image installs Python 3.12 via the deadsnakes PPA on top of Ubuntu 22.04, then installs all Python dependencies from `requirements.txt`. Additional domain-specific setup steps run at build time:
+
+```dockerfile
+# Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Proof grader for imo_proof domain
+RUN pip install -e proofgrader_repo
+
+# Asset download for Balrog domains
+RUN python -m domains.balrog.scripts.post_install
+
+# PyTorch with CUDA 13.0 support (for Genesis domain)
+RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+```
+
+### CUDA Version Selection
+
+If you are running on a different CUDA version, update the PyTorch install line in the Dockerfile before building:
+
+| CUDA Version | PyTorch install command |
+|---|---|
+| 11.8 | `torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cu118` |
+| 12.1 | `torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cu121` |
+| 12.4 | `torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124` |
+| 13.0 | `torch torchvision --index-url https://download.pytorch.org/whl/cu130` _(default)_ |
+
+Run `nvidia-smi` on the host to check your installed CUDA version.
+
+---
+
+## Building the Image
+
+```bash
+docker build --network=host -t hyperagents .
+```
+
+The `--network=host` flag is required during the build so that `pip install` commands inside the image can reach PyPI and the GitHub-hosted packages in `requirements.txt`. Without it, package downloads may fail in environments that rely on a forwarded proxy.
+
+The image tag `hyperagents` matches the `REPO_NAME` constant in `utils/constants.py`:
+
+```python
+# utils/constants.py
+REPO_NAME = "hyperagents"
+```
+
+This constant is used throughout `docker_utils.py` and `generate_loop.py` to derive image names, container names, and in-container working directory paths (`/hyperagents`).
+
+---
+
+## Container Lifecycle Details
+
+### `build_container`
+
+Defined in `utils/docker_utils.py`, this function creates and returns a running container. It:
+
+- Checks whether the `hyperagents` image already exists and skips the build if so (pass `force_rebuild=True` to override)
+- Runs the container with `network_mode="host"` so the agent inside can reach LLM API endpoints
+- Mounts the local repository as a read-write volume at `/{REPO_NAME}` (`/hyperagents`) inside the container
+- Conditionally enables GPU passthrough for domains that include `"genesis"` in their name
+
+```python
+# Volume mount setup (from docker_utils.py)
+"volumes": {
+    os.path.abspath(repo_path): {"bind": f"/{REPO_NAME}", "mode": "rw"}
+}
+```
+
+The container is named `hyperagents-gl-container-<timestamp>` for generation runs and `hyperagents-ens-container-<timestamp>` for ensemble evaluation runs.
+
+### GPU Support
+
+GPU passthrough is only enabled when at least one of the target `--domains` contains the string `"genesis"`. For other domains the container runs without GPU access.
+
+- **Docker + nvidia runtime**: uses `DeviceRequest(count=-1, capabilities=[["gpu"]])`
+- **Podman**: falls back to CDI format (`--device nvidia.com/gpu=all`) via a subprocess call to the Podman CLI, since the Python Docker SDK does not support Podman's GPU interface directly
+
+### `cleanup_container`
+
+After every generation (including on errors), `cleanup_container` stops the container with a 10-second timeout and then forcibly removes it. This prevents stale containers from accumulating on the host.
+
+---
+
+## Timeout Values
+
+Each operation executed inside a container uses `timeout` to prevent indefinitely hanging runs:
+
+| Operation | Timeout | Location |
+|---|---|---|
+| Meta-agent run (`run_meta_agent.py`) | **21,600 s (6 h)** | `generate_loop.py` |
+| DGM coding agent run | **21,600 s (6 h)** | `generate_loop.py` |
+| Domain evaluation harness | **18,000 s (5 h)** | `generate_loop.py` |
+| Evaluation report generation | **10,800 s (3 h)** | `generate_loop.py` |
+| Ensemble scoring | **10,800 s (3 h)** | `generate_loop.py` |
+| Parent selection (`run_select_next_parent`) | **3,600 s (1 h)** | `generate_loop.py` |
+
+---
+
+## Container Reset
+
+Before cleanup, the generation loop always resets the repository inside the container to the root commit so that the volume-mounted directory is left in a clean state:
+
+```bash
+git reset --hard <root_commit>
+git clean -fd
+```
+
+This reset runs in the `finally` block of every `generate` and `get_ensemble_scores_container` call, ensuring it executes even if the agent or evaluation step fails.
+
+---
+
+## Working Directory Layout Inside Container
+
+```
+/hyperagents/         ← volume-mounted host repo (read-write)
+/tmp/                 ← ephemeral output folder for agent outputs and eval results
+/tmp/agent_output/    ← meta-agent outputs, including model_patch.diff
+/tmp/<run_id>/        ← evaluation results, copied back to host after each generation
+```
+
+After each generation, the host receives:
+- `outputs/generate_<run_id>/gen_<N>/agent_output/` — the meta-agent's diff and chat history
+- `outputs/generate_<run_id>/gen_<N>/<domain>_eval/` — evaluation results and reports

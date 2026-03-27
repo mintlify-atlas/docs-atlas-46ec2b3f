@@ -1,0 +1,145 @@
+---
+title: "System Architecture"
+description: "How HyperAgents orchestrates a two-agent hierarchy, an evolutionary archive, and Docker sandboxes to iteratively self-improve."
+---
+
+HyperAgents is built around a single core loop: an AI meta-agent rewrites the codebase, a task-agent is evaluated in an isolated Docker container, and a score is stored in an archive that guides which agent to improve next. Every generation is reproducible, sandboxed, and tracked.
+
+## The Two-Agent Hierarchy
+
+Two Python classes carry the load:
+
+| Class | File | Responsibility |
+|---|---|---|
+| `MetaAgent` | `meta_agent.py` | Proposes code changes to the entire repository |
+| `TaskAgent` | `task_agent.py` | Solves individual domain tasks and returns predictions |
+
+Both extend `AgentSystem` (`agent/base_agent.py`) and share the same `chat_with_agent` call-loop (`agent/llm_withtools.py`). The key difference is *what* they receive as input and *which tools* they are given:
+
+- `MetaAgent.forward()` gets `repo_path` + `eval_path` and runs with `tools_available='all'` (bash + editor).
+- `TaskAgent.forward()` gets a domain `inputs` dict and runs with no tools by default — the meta-agent is expected to change that over time.
+
+## The Evolutionary Archive
+
+Every generation that produces a runnable diff is registered in `outputs/<run_id>/archive.jsonl`. Each line is a JSON snapshot:
+
+```jsonl title="archive.jsonl"
+{"current_genid": "initial", "archive": ["initial"]}
+{"current_genid": 1, "archive": ["initial", 1]}
+{"current_genid": 2, "archive": ["initial", 1, 2]}
+```
+
+The archive is append-only. `update_and_save_archive()` in `utils/gl_utils.py` is called after every `generate()` call. Each generation node also has a `gen_<id>/metadata.json` file that records:
+
+- `parent_genid` — which node this generation branched from
+- `prev_patch_files` — cumulative lineage of `.diff` files
+- `curr_patch_files` — the diff produced in this generation
+- `run_eval` / `run_full_eval` — whether evaluation was executed
+- `valid_parent` — whether this node can be selected as a future parent
+
+Scores are stored under `gen_<id>/<domain>_eval/report.json` and read back by `get_score()` during parent selection.
+
+## Docker Sandboxing
+
+Every `generate()` call spins up a fresh Docker container:
+
+```python title="generate_loop.py (generate)"
+container = build_container(docker_client, root_dir, image_name, container_name, domains=domains)
+container.start()
+```
+
+Inside the container, the system:
+1. Applies all accumulated `.diff` patch files from the parent's lineage (`apply_diffs_container`).
+2. Runs `run_meta_agent.py` (6-hour timeout) to let the meta-agent edit the code.
+3. Runs `domains/harness.py` (5-hour timeout per domain) to evaluate the modified `task_agent.py`.
+4. Copies outputs back to the host with `copy_from_container`.
+5. Runs `git reset --hard` and `git clean -fd` to restore the container to a pristine state before teardown.
+
+Isolating each generation in Docker prevents changes from one run leaking into another and ensures that the repo always starts from a known commit hash.
+
+<Warning>
+The domain code (`domains/`) is deliberately excluded from the diff applied to the container. Any changes the meta-agent makes to evaluation code are stripped by `filter_patch_by_files` and `reset_paths_to_commit` in `run_meta_agent.py`.
+</Warning>
+
+## How It All Fits Together
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        generate_loop()                          │
+│                                                                 │
+│  archive = ["initial"]                                          │
+│                                                                 │
+│  for generation in 1..max_generation:                           │
+│    ┌───────────────────────────────────────────────────────┐    │
+│    │                  generate()  (Docker container)       │    │
+│    │                                                       │    │
+│    │  1. apply_diffs_container(parent lineage patches)     │    │
+│    │                     ↓                                 │    │
+│    │  2. run_meta_agent.py → MetaAgent.forward()           │    │
+│    │     (modifies repo, saves model_patch.diff)           │    │
+│    │                     ↓                                 │    │
+│    │  3. apply model_patch.diff                            │    │
+│    │                     ↓                                 │    │
+│    │  4. domains/harness.py → TaskAgent.forward()          │    │
+│    │     (runs on eval dataset, saves report.json)         │    │
+│    │                     ↓                                 │    │
+│    │  5. git reset --hard; cleanup container               │    │
+│    └───────────────────────────────────────────────────────┘    │
+│                     ↓                                           │
+│    update_and_save_archive()  →  archive.jsonl                  │
+│                     ↓                                           │
+│    select_parent(archive, method=parent_selection)              │
+│      (random | latest | best | score_prop | score_child_prop)   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+<Steps>
+  <Step title="Snapshot the repo">
+    `setup_initial_gen` copies the repo into `gen_initial/<REPO_NAME>`, strips excluded directories (outputs, analysis, baselines), commits it, and records the commit hash as `root_commit`.
+  </Step>
+  <Step title="Meta-agent proposes changes">
+    Inside a Docker container, `MetaAgent.forward(repo_path, eval_path)` runs an LLM with bash and editor tools. It inspects previous scores, reads the codebase, and emits a git diff saved as `model_patch.diff`.
+  </Step>
+  <Step title="Task-agent is evaluated">
+    The patched repo is handed to `domains/harness.py`, which loads `TaskAgent` via `load_task_agent()` and runs it in parallel across the evaluation dataset. Results are written to `report.json`.
+  </Step>
+  <Step title="Archive is updated">
+    `update_and_save_archive()` appends the new generation ID to `archive.jsonl`. The generation's score and metadata are stored in `gen_<id>/`.
+  </Step>
+  <Step title="Parent is selected for next generation">
+    `select_parent()` reads the archive and, using the configured selection method, picks which past generation's code becomes the starting point for the next meta-agent call.
+  </Step>
+</Steps>
+
+## Directory Layout
+
+```
+outputs/
+└── generate_<run_id>/
+    ├── archive.jsonl            # Append-only archive of all generations
+    ├── generate_loop.log        # CLI args log
+    ├── gen_initial/
+    │   ├── HyperAgents/         # Snapshotted repo at root_commit
+    │   └── <domain>_eval/       # Baseline evaluation results
+    ├── gen_1/
+    │   ├── metadata.json        # Parent, patch files, eval flags
+    │   ├── agent_output/
+    │   │   ├── model_patch.diff # Diff produced by meta-agent
+    │   │   └── meta_agent_chat_history.md
+    │   └── <domain>_eval/
+    │       └── report.json      # Scores for this generation
+    └── gen_2/
+        └── ...
+```
+
+<CardGroup cols={3}>
+  <Card title="Meta-Agent" icon="robot" href="/concepts/meta-agent">
+    How the meta-agent reads the archive and edits the codebase.
+  </Card>
+  <Card title="Task-Agent" icon="code" href="/concepts/task-agent">
+    How the task-agent processes domain inputs and returns predictions.
+  </Card>
+  <Card title="Evolution Loop" icon="arrow-rotate-right" href="/concepts/evolution-loop">
+    Parameter reference and parent-selection strategies.
+  </Card>
+</CardGroup>

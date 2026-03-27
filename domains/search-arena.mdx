@@ -1,0 +1,108 @@
+---
+title: Search Arena
+description: Evaluate agent ability to judge which of two web-search responses better answers a user query.
+---
+
+The `search_arena` domain tests pairwise preference judgment for web-search results. Given two model-generated responses (`messages_a` and `messages_b`) to a search query, the agent must predict which response a human annotator preferred.
+
+## What It Evaluates
+
+This is a binary preference-judgment task. The domain measures:
+
+- **Overall accuracy** — fraction of comparisons where the agent's preference matches the human winner label
+- **Per-label precision and recall** — for each possible winner label
+- **Label distribution alignment** — how closely the predicted distribution tracks the ground truth
+
+## Dataset Format
+
+The dataset is stored at `domains/search_arena/dataset.csv`. Each row represents one pairwise comparison:
+
+| Column | Description |
+|---|---|
+| `question_id` | Unique identifier for the comparison |
+| `messages_a` | First model's conversation / response |
+| `messages_b` | Second model's conversation / response |
+| `winner` | Ground truth label indicating which response was preferred |
+
+The `utils.py` constants confirm this layout:
+
+```python
+# domains/search_arena/utils.py
+QUESTION_ID = "question_id"
+GROUND_TRUTH_KEY = "winner"
+MODEL = "gpt-4o"
+```
+
+The `format_input_dict` function passes both responses to the agent:
+
+```python
+def format_input_dict(row):
+    return {
+        "domain": "search_arena",
+        "messages_a": row['messages_a'],
+        "messages_b": row['messages_b'],
+    }
+```
+
+## Dataset Subsets
+
+Filtered question IDs are tracked in `domains/search_arena/dataset_filtered_100_ids.json`. The curated subset files follow the same convention as `paper_review`:
+
+```
+domains/search_arena/dataset_filtered_100_train.csv
+domains/search_arena/dataset_filtered_100_val.csv
+domains/search_arena/dataset_filtered_100_test.csv
+```
+
+Each split contains 100 balanced samples. The `_filtered_100_train` suffix is the default evaluation subset.
+
+## Setup and Run
+
+<Steps>
+  <Step title="Download and curate dataset subsets">
+    Download the dataset from HuggingFace and generate the balanced train/val/test CSV files:
+
+    ```bash
+    python -m domains.search_arena.curate_subsets
+    ```
+
+    This downloads `lmarena-ai/search-arena-v1-7k`, saves `dataset.csv`, filters it, and writes the three split files (`dataset_filtered_100_train.csv`, `dataset_filtered_100_val.csv`, `dataset_filtered_100_test.csv`).
+  </Step>
+  <Step title="Run the initial evaluation">
+    ```bash
+    python -m domains.harness \
+      --domain search_arena \
+      --run_id initial_search_arena_filtered_100_train_0 \
+      --subset _filtered_100_train \
+      --num_samples 10
+    ```
+  </Step>
+  <Step title="Generate the report">
+    ```bash
+    python -m domains.report --domain search_arena \
+      --dname ./outputs/initial_search_arena_filtered_100_train_0
+    ```
+  </Step>
+</Steps>
+
+## Scoring
+
+The primary metric is **`overall_accuracy`** — the fraction of comparisons where the agent's predicted winner matches the human-labeled winner (case-insensitive).
+
+The report includes:
+
+- Per-label precision and recall for each winner value
+- Random-guess baseline computed from the ground truth winner distribution
+- Prediction and ground truth label distributions
+- Lists of passed and failed question IDs
+
+## Harness Behavior
+
+- **Parallelism**: supports up to `--num_workers` concurrent threads (default: 5).
+- **Resuming**: pass `--resume_from <output_dir>` to skip already-evaluated questions.
+- **Ensemble**: `can_domain_ensembled("search_arena")` returns `True`.
+- **Splits**: the domain has `train`, `val`, and `test` splits. Test split is only used when `eval_test=True` is passed to `get_domain_splits`.
+
+<Note>
+  The staged evaluation sample count for `search_arena` is 10 out of 100 (10%), matching `paper_review`. This is defined in `get_domain_stagedeval_frac` in `utils/domain_utils.py`.
+</Note>

@@ -1,0 +1,168 @@
+---
+title: Polyglot
+description: SWE-bench-style multi-language coding benchmark that evaluates agents in per-instance Docker containers across six programming languages.
+---
+
+The `polyglot` domain is a software engineering benchmark modeled after SWE-bench. Agents are given a problem statement and must produce a code patch that makes failing tests pass. Unlike other HyperAgents domains, each instance runs inside its own **Docker container** — a fresh, isolated environment containing the target repository at a specific commit.
+
+## What It Evaluates
+
+Polyglot tests the ability to fix bugs and implement features in real code repositories across six languages: **Python**, **Rust**, **Go**, **JavaScript**, **C++**, and **Java**. The primary metric is **`accuracy_score`** — the fraction of instances where the agent's patch causes all tests to pass (`resolved`).
+
+Each instance is independent. The eval result for a single instance is one of:
+
+| Result | Meaning |
+|---|---|
+| `resolved` | Patch applied; all tests pass |
+| `unresolved` | Patch applied; tests still fail |
+| `empty_patch` | Agent produced no patch |
+| `incomplete` | Container setup failed before agent ran |
+| `error` | Unexpected exception during processing |
+
+## How It Differs from Other Domains
+
+- **Separate harness**: Polyglot uses `domains/polyglot/harness.py` instead of `domains/harness.py`. The main harness does **not** handle the `polyglot` domain.
+- **Docker containers**: Each instance builds and starts a dedicated container with the repository pre-installed at the correct commit.
+- **No CSV dataset**: The dataset is a JSON file (`polyglot_benchmark_metadata.json`) prepared via `prepare_polyglot_dataset.py`.
+- **Per-language test commands**: Test execution is language-specific (e.g., `pytest` for Python, `cargo test` for Rust, `go test` for Go, `npm run test` for JavaScript, `cmake + make` for C++, `./gradlew test` for Java).
+- **10-minute agent timeout**: Each agent invocation is wrapped in `timeout 600` inside the container.
+- **No ensemble support**: `can_domain_ensembled("polyglot")` returns `False`.
+
+## Dataset Subsets
+
+Two predefined subsets are available in `domains/polyglot/subsets/`:
+
+| Subset | File | Description |
+|---|---|---|
+| `small` | `subsets/small.json` | Small list of instance IDs for quick testing |
+| `medium` | `subsets/medium.json` | Larger representative set |
+
+## Setup
+
+<Steps>
+  <Step title="Clone SWE-bench">
+    Polyglot depends on SWE-bench for Docker image building utilities:
+
+    ```bash
+    cd domains/polyglot
+    git clone https://github.com/princeton-nlp/SWE-bench.git
+    cd SWE-bench
+    git checkout dc4c087c2b9e4cefebf2e3d201d27e36
+    pip install -e .
+    cd ../../../
+    ```
+
+    <Warning>
+      Polyglot is pinned to a specific SWE-bench commit (`dc4c087`). Using a different version may break Docker image building.
+    </Warning>
+  </Step>
+  <Step title="Prepare the dataset">
+    ```bash
+    python -m domains.polyglot.prepare_polyglot_dataset
+    ```
+
+    This generates `domains/polyglot/polyglot_benchmark_metadata.json`.
+  </Step>
+  <Step title="Run evaluation">
+    ```bash
+    python -m domains.polyglot.harness \
+      --subset small \
+      --output_dir ./outputs/initial_polyglot_0 \
+      --model_name_or_path eval_run
+    ```
+
+    Key arguments:
+
+    | Argument | Default | Description |
+    |---|---|---|
+    | `--subset` | `small` | Dataset subset: `small`, `medium`, or full |
+    | `--num_samples` | `-1` (all) | Limit number of instances |
+    | `--max_workers` | `5` | Parallel Docker containers |
+    | `--model_name_or_path` | timestamp | Label for this run |
+    | `--model_patch_paths` | None | Comma-separated patch files to pre-apply |
+  </Step>
+  <Step title="Generate the report">
+    ```bash
+    python -m domains.polyglot.report \
+      --output_dir ./outputs/initial_polyglot_0 \
+      --model_name_or_path eval_run
+    ```
+
+    The report is written to `./outputs/initial_polyglot_0/report.json`.
+  </Step>
+</Steps>
+
+## Container Lifecycle
+
+For each instance, the harness:
+
+1. Builds a Docker image for the repository/language combination (cached after first build)
+2. Starts a container from that image
+3. Copies `task_agent.py`, `agent/`, `utils/`, and other required files into the container
+4. Applies any pre-existing model patches (from `--model_patch_paths`)
+5. Installs `requirements.txt` inside the container
+6. Runs `run_task_agent.py` with a 10-minute timeout
+7. Reads the resulting `model_patch.diff` from the container
+8. Resets the repository to `test_commit` and applies the patch
+9. Runs the language-specific test command with a 2-minute timeout
+10. Cleans up the container
+
+```python
+# Test commands per language (domains/polyglot/constants.py)
+TEST_COMMANDS = {
+    "python":     ["pytest -rA --tb=long"],
+    "rust":       ["cargo test -- --include-ignored"],
+    "go":         ["go test ./..."],
+    "javascript": [  # sets up node_modules symlink, then runs tests
+        "set -e",
+        "[ ! -e node_modules ] && ln -s /npm-install/node_modules .",
+        "[ ! -e package-lock.json ] && ln -s /npm-install/package-lock.json .",
+        "sed -i 's/\\bxtest(/test(/g' *.spec.js",
+        "npm run test",
+    ],
+    "cpp": [  # builds in a build/ subdirectory via cmake + make
+        "set -e",
+        "[ ! -d \"build\" ] && mkdir build",
+        "cd build",
+        "cmake -DEXERCISM_RUN_ALL_TESTS=1 -G \"Unix Makefiles\" ..",
+        "make",
+        "cd ../",
+    ],
+    "java":       ["./gradlew test"],
+}
+```
+
+## Report Format
+
+The `report.json` produced by `domains/polyglot/report.py` contains:
+
+```json
+{
+  "accuracy_score": 0.15,
+  "total_resolved_instances": 9,
+  "total_submitted_instances": 60,
+  "total_instances": 60,
+  "resolved_ids": [...],
+  "unresolved_ids": [...],
+  "total_emptypatch_ids": [...]
+}
+```
+
+## Domain Properties
+
+| Property | Value |
+|---|---|
+| Score key | `accuracy_score` |
+| Splits | `train` only |
+| Eval subset | full dataset |
+| Ensemble supported | No |
+| Staged eval samples | 10 / 60 (~17%) |
+| Parallelism | Multiple Docker containers via `--max_workers` |
+
+<Note>
+  The `accuracy_score` is computed as `resolved_instances / submitted_instances`. If `expected_num_tasks` is explicitly provided to `get_all_performance()`, it is used as the denominator instead, ensuring that incomplete runs are not artificially inflated.
+</Note>
+
+<Tip>
+  Environment variables `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `METAGEN_ACCESS_TOKEN` are forwarded into each Docker container automatically. Ensure these are set in the host environment before running the harness.
+</Tip>

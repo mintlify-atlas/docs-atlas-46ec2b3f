@@ -1,0 +1,283 @@
+---
+title: LLM Interface
+description: Core LLM API functions for making completions requests and running tool-augmented agent conversations.
+---
+
+## Overview
+
+The LLM interface provides two layers of abstraction:
+
+- `get_response_from_llm` — a thin, retry-wrapped wrapper around [LiteLLM](https://docs.litellm.ai/) for single-turn completions.
+- `chat_with_agent` — a higher-level loop that injects tool descriptions into the prompt and dispatches tool calls until the model stops requesting them.
+
+Both are in `agent/llm.py` and `agent/llm_withtools.py`.
+
+---
+
+## Model Constants
+
+All supported models are exposed as module-level constants in `agent/llm.py`.
+
+| Constant | Model string | Provider |
+|---|---|---|
+| `CLAUDE_MODEL` | `anthropic/claude-sonnet-4-5-20250929` | Anthropic |
+| `CLAUDE_HAIKU_MODEL` | `anthropic/claude-3-haiku-20240307` | Anthropic |
+| `CLAUDE_35NEW_MODEL` | `anthropic/claude-3-5-sonnet-20241022` | Anthropic |
+| `OPENAI_MODEL` | `openai/gpt-4o` | OpenAI |
+| `OPENAI_MINI_MODEL` | `openai/gpt-4o-mini` | OpenAI |
+| `OPENAI_O3_MODEL` | `openai/o3` | OpenAI |
+| `OPENAI_O3MINI_MODEL` | `openai/o3-mini` | OpenAI |
+| `OPENAI_O4MINI_MODEL` | `openai/o4-mini` | OpenAI |
+| `OPENAI_GPT52_MODEL` | `openai/gpt-5.2` | OpenAI |
+| `OPENAI_GPT5_MODEL` | `openai/gpt-5` | OpenAI |
+| `OPENAI_GPT5MINI_MODEL` | `openai/gpt-5-mini` | OpenAI |
+| `GEMINI_3_MODEL` | `gemini/gemini-3-pro-preview` | Google |
+| `GEMINI_MODEL` | `gemini/gemini-2.5-pro` | Google |
+| `GEMINI_FLASH_MODEL` | `gemini/gemini-2.5-flash` | Google |
+
+The default token budget is:
+
+```python
+MAX_TOKENS = 16384
+```
+
+---
+
+## `get_response_from_llm`
+
+```python
+from agent.llm import get_response_from_llm
+
+response_text, new_msg_history, info = get_response_from_llm(
+    msg="What is the capital of France?",
+    model="openai/gpt-4o",
+)
+```
+
+### Signature
+
+```python
+def get_response_from_llm(
+    msg: str,
+    model: str = OPENAI_MODEL,
+    temperature: float = 0.0,
+    max_tokens: int = MAX_TOKENS,
+    msg_history=None,
+) -> Tuple[str, list, dict]
+```
+
+### Parameters
+
+<ParamField path="msg" type="str" required>
+  The new user message to send to the model.
+</ParamField>
+
+<ParamField path="model" type="str" default="openai/gpt-4o">
+  LiteLLM model string. Must be prefixed with the provider namespace, e.g. `openai/gpt-4o` or `anthropic/claude-sonnet-4-5-20250929`. Use one of the module-level constants listed above.
+</ParamField>
+
+<ParamField path="temperature" type="float" default="0.0">
+  Sampling temperature. Ignored for `openai/gpt-5` and `openai/gpt-5-mini` — those models only support the API default of `1.0`.
+</ParamField>
+
+<ParamField path="max_tokens" type="int" default="16384">
+  Maximum tokens to generate. Model-specific capping applies (see below).
+</ParamField>
+
+<ParamField path="msg_history" type="list | None" default="None">
+  Existing conversation history. Each entry is a dict with `"role"` and **`"text"`** keys. The function converts `"text"` to `"content"` before calling LiteLLM and converts back on return, keeping the internal format consistent.
+</ParamField>
+
+### Return Value
+
+Returns a 3-tuple `(response_text, new_msg_history, info)`:
+
+<ResponseField name="response_text" type="str">
+  The model's reply text.
+</ResponseField>
+
+<ResponseField name="new_msg_history" type="list">
+  Updated conversation history including the new user message and the model reply. Entries use the `"text"` key (not `"content"`).
+</ResponseField>
+
+<ResponseField name="info" type="dict">
+  Currently always an empty dict `{}`. Reserved for future metadata.
+</ResponseField>
+
+### Model-Specific Behaviors
+
+| Condition | Behavior |
+|---|---|
+| `model` is `openai/gpt-5` or `openai/gpt-5-mini` | `temperature` is **not** passed to the API |
+| `"gpt-5"` appears anywhere in `model` | Uses `max_completion_tokens` instead of `max_tokens` |
+| `"claude-3-haiku"` appears in `model` | `max_tokens` is capped at `min(max_tokens, 4096)` |
+
+### Message History Format
+
+Conversation history entries use the `"text"` key internally:
+
+```python
+msg_history = [
+    {"role": "user",      "text": "Hello!"},
+    {"role": "assistant", "text": "Hi, how can I help?"},
+]
+```
+
+Before the LiteLLM API call the function rewrites `"text"` → `"content"` and restores `"content"` → `"text"` on the way out. This keeps history compatible with HyperAgents' internal format while remaining transparent to callers.
+
+### Retry Behaviour
+
+`get_response_from_llm` is decorated with an exponential-backoff retry:
+
+```python
+@backoff.on_exception(
+    backoff.expo,
+    (requests.exceptions.RequestException, json.JSONDecodeError, KeyError),
+    max_time=600,   # give up after 10 minutes
+    max_value=60,   # cap individual delay at 60 s
+)
+```
+
+Network errors, malformed JSON responses, and missing keys in the API response are all retried automatically.
+
+---
+
+## `chat_with_agent`
+
+Runs a full tool-use loop: injects available tool descriptions into the system prompt, calls the LLM, dispatches any tool calls found in the response, feeds results back, and repeats until the model produces a response with no tool calls or the call limit is hit.
+
+```python
+from agent.llm_withtools import chat_with_agent
+
+new_history = chat_with_agent(
+    msg="List files in /tmp",
+    model="anthropic/claude-sonnet-4-5-20250929",
+    tools_available="all",
+)
+```
+
+### Signature
+
+```python
+def chat_with_agent(
+    msg,
+    model="claude-4-sonnet-genai",
+    msg_history=None,
+    logging=print,
+    tools_available=[],
+    multiple_tool_calls=False,
+    max_tool_calls=40,
+) -> list
+```
+
+### Parameters
+
+<ParamField path="msg" type="str" required>
+  The user message to start the conversation.
+</ParamField>
+
+<ParamField path="model" type="str" default="claude-4-sonnet-genai">
+  LiteLLM model string. Same format as `get_response_from_llm`.
+</ParamField>
+
+<ParamField path="msg_history" type="list | None" default="None">
+  Prior conversation history in the internal `"text"`-keyed format. Passed through to `get_response_from_llm` unchanged.
+</ParamField>
+
+<ParamField path="logging" type="callable" default="print">
+  Logging function. Called with a single string argument for each significant event (input message, model output, tool output, errors).
+</ParamField>
+
+<ParamField path="tools_available" type="list | 'all'" default="[]">
+  Controls which tools are loaded:
+  - `[]` (empty list) — no tools are loaded; the model receives no tool instructions.
+  - `'all'` — every tool module found in `agent/tools/` is loaded.
+  - A list of tool name strings, e.g. `['bash', 'edit']` — only the named tools are loaded.
+</ParamField>
+
+<ParamField path="multiple_tool_calls" type="bool" default="false">
+  When `True`, all tool calls present in a single model response are dispatched in sequence. When `False` (default), only the first tool call is processed per response.
+</ParamField>
+
+<ParamField path="max_tool_calls" type="int" default="40">
+  Maximum total tool calls allowed across the entire conversation. Set to `-1` for unlimited. When the limit is reached the loop exits and the accumulated history is returned.
+</ParamField>
+
+### Return Value
+
+<ResponseField name="new_msg_history" type="list">
+  The complete conversation history after all tool-use rounds, in the `"text"`-keyed internal format.
+</ResponseField>
+
+### Tool-Use Loop
+
+1. Tool descriptions are formatted via `get_tooluse_prompt()` and prepended to `msg`.
+2. `get_response_from_llm` is called with the combined prompt.
+3. The response is scanned for `<json>...</json>` blocks using the regex `r'<json>\s*(\{.*?\})\s*</json>'`.
+4. Each block must contain a JSON object with `tool_name` and `tool_input` keys:
+
+   ```json
+   {
+     "tool_name": "bash",
+     "tool_input": {"command": "ls /tmp"}
+   }
+   ```
+
+5. `process_tool_call` dispatches to the matching tool function and the output is wrapped:
+
+   ```json
+   {
+     "tool_name": "bash",
+     "tool_input": {"command": "ls /tmp"},
+     "tool_output": "file1.txt\nfile2.txt"
+   }
+   ```
+
+6. The wrapped result is sent back to the model as the next user message.
+7. The loop continues until no tool calls are found in a response.
+
+### Truncated Tool Call Retry
+
+`should_retry_tool_use(response, tool_uses)` detects responses where the model started forming a tool call but was cut off by the output token limit. It returns `True` when **all** of the following hold:
+
+- No valid tool calls were parsed from the response.
+- The response contains `<json>`, `tool_name`, and `tool_input` markers, in that order.
+- `len(response) >= 2000`.
+
+When a retry is needed, the message `"Error: Output context exceeded. Please try again."` is sent back to the model.
+
+---
+
+## `process_tool_call`
+
+```python
+from agent.llm_withtools import process_tool_call
+
+result = process_tool_call(tools_dict, "bash", {"command": "echo hello"})
+```
+
+### Signature
+
+```python
+def process_tool_call(tools_dict: dict, tool_name: str, tool_input: dict) -> str
+```
+
+### Parameters
+
+<ParamField path="tools_dict" type="dict" required>
+  Mapping of tool name → tool dict as built by `load_tools`. Each value has `info` and `function` keys.
+</ParamField>
+
+<ParamField path="tool_name" type="str" required>
+  Name of the tool to call, e.g. `"bash"` or `"editor"`.
+</ParamField>
+
+<ParamField path="tool_input" type="dict" required>
+  Keyword arguments forwarded to the tool's function via `**tool_input`.
+</ParamField>
+
+### Return Value
+
+<ResponseField name="result" type="str">
+  The string output from the tool function, or an error message prefixed with `"Error: "` if the tool is not found or raises an exception.
+</ResponseField>

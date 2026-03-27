@@ -1,0 +1,276 @@
+---
+title: "Working with Experiment Logs"
+description: "How to extract the published experiment archives, understand the metadata and archive formats, read evaluation scores programmatically, and interpret the parent-selection logic."
+---
+
+## Downloading and extracting the logs
+
+The published experiment logs are distributed as a multi-part ZIP archive. All part files (`outputs_os_parts.z01`, `.z02`, … and the final `.zip`) must be in the same directory before extraction.
+
+<Steps>
+
+### Merge the split parts into a single ZIP
+
+```bash
+zip -s 0 outputs_os_parts.zip --out unsplit_logs.zip
+```
+
+The `-s 0` flag tells `zip` to merge all split volumes into a single unsplit archive named `unsplit_logs.zip`.
+
+### Extract the merged archive
+
+```bash
+unzip unsplit_outputs.zip
+```
+
+This expands the archive in place, recreating the `outputs/` directory tree.
+
+### Verify the structure
+
+```bash
+ls outputs/
+# generate_20251216_192315_534288/
+# generate_20251219_105346_856092/
+# ...
+```
+
+Each subdirectory is one complete experiment run.
+
+</Steps>
+
+<Note>
+The extraction command in the README uses `unzip unsplit_outputs.zip` (without `_logs`). Use whichever filename you chose in the merge step.
+</Note>
+
+---
+
+## Understanding `metadata.json`
+
+Every generation directory contains a `metadata.json` file. It is written at the end of the `generate()` call in `generate_loop.py` and captures everything needed to understand or replay that generation.
+
+```json
+{
+    "gen_output_dir": "/abs/path/to/outputs/generate_20251216_192315_534288/gen_5",
+    "current_genid": 5,
+    "parent_genid": 3,
+    "run_baseline": null,
+    "prev_patch_files": [
+        "outputs/.../gen_1/agent_output/model_patch.diff",
+        "outputs/.../gen_3/agent_output/model_patch.diff"
+    ],
+    "curr_patch_files": [
+        "outputs/.../gen_5/agent_output/model_patch.diff"
+    ],
+    "parent_agent_success": true,
+    "run_eval": true,
+    "run_full_eval": true,
+    "valid_parent": true,
+    "optimize_option": "only_agent",
+    "agent_archive_path": null,
+    "can_select_next_parent": true
+}
+```
+
+### Field reference
+
+<Accordion title="gen_output_dir">
+
+**Type:** `string`
+
+Absolute path to this generation's output directory on the machine where the run executed. When working with downloaded logs on a different machine, this path will not be valid—use the directory containing `metadata.json` itself instead.
+
+</Accordion>
+
+<Accordion title="current_genid / parent_genid">
+
+**Type:** `int | "initial" | null`
+
+`current_genid` is the unique identifier for this node in the archive. It is `"initial"` for the baseline snapshot and an integer (`0`, `1`, `2`, …) for evolved generations.
+
+`parent_genid` points to the generation whose code state was used as the starting point for this run. For the `gen_initial` node it is `null`. The lineage chain (`parent_genid` pointers) forms a tree rooted at `"initial"`.
+
+</Accordion>
+
+<Accordion title="prev_patch_files / curr_patch_files">
+
+**Type:** `list[string]`
+
+`prev_patch_files` contains all `.diff` files that were applied to the Docker container *before* the meta-agent ran. This is the complete ordered list of patches from the root to the parent node.
+
+`curr_patch_files` contains the single `model_patch.diff` produced by *this* generation's meta-agent. Together, `prev_patch_files + curr_patch_files` gives the complete patch lineage needed to reconstruct the agent at this node—this combined list is what `get_patch_files()` returns.
+
+</Accordion>
+
+<Accordion title="parent_agent_success">
+
+**Type:** `bool`
+
+`true` if the meta-agent's Docker container exited with code 0. A `false` value means the container timed out, raised an exception, or the agent produced code that did not compile. When `parent_agent_success` is `false`, the *parent* node's `valid_parent` flag is retroactively set to `false` via `update_node_metadata`.
+
+</Accordion>
+
+<Accordion title="run_eval / run_full_eval">
+
+**Type:** `bool`
+
+`run_eval` is `true` if evaluation was attempted. It is set to `false` when the meta-agent produced no diff (empty or missing `model_patch.diff`) or when an exception occurred before evaluation could start.
+
+`run_full_eval` is `true` only if the full (non-staged) evaluation completed. For staged evaluation, the loop first runs on a small subset; if the score is above zero the full evaluation proceeds and `run_full_eval` is set to `true`. For `gen_initial`, `run_full_eval` is absent or `false`.
+
+The staged evaluation adjustment factor for a domain is provided by `get_domain_stagedeval_frac(domain)` in `utils/domain_utils.py`. Scores are scaled by this factor when `run_full_eval` is false so that they are comparable across nodes.
+
+</Accordion>
+
+<Accordion title="valid_parent">
+
+**Type:** `bool`
+
+The key eligibility flag. A node with `valid_parent: true` can be selected as a parent in future generations. Computed as:
+
+```
+valid_parent = run_eval AND (eval_successful OR bootstrapped_from_patches)
+```
+
+where `eval_successful` means `get_score()` returned a non-`None` value for every domain. The `gen_initial` node is always considered a valid parent.
+
+</Accordion>
+
+<Accordion title="optimize_option">
+
+**Type:** `string`
+
+Controls what the meta-agent was asked to improve:
+
+| Value | Meaning |
+|---|---|
+| `"only_agent"` | Improve the task agent (`task_agent.py`) only. |
+| `"only_ensemble"` | Improve the ensemble logic (`ensemble.py`) over a fixed agent archive. |
+| `"both_agent_ensemble"` | Improve both the task agent and the ensemble logic. |
+
+</Accordion>
+
+<Accordion title="can_select_next_parent">
+
+**Type:** `bool`
+
+`true` by default. Set to `false` if the `select_next_parent_container` call failed on this node. The `get_latest_can_select_parent()` function in `utils/gl_utils.py` walks the archive backwards to find the most recent node with this flag set to `true`, which is the node whose agent code is loaded into the container for parent selection.
+
+</Accordion>
+
+---
+
+## Understanding `archive.jsonl`
+
+`archive.jsonl` is an append-only file at the run root. A new JSON line is written after every generation completes:
+
+```jsonl
+{"current_genid": "initial", "archive": ["initial"]}
+{"current_genid": 1, "archive": ["initial", 1]}
+{"current_genid": 2, "archive": ["initial", 1, 2]}
+{"current_genid": 3, "archive": ["initial", 1, 2, 3]}
+```
+
+Each line is self-contained: `archive` is the complete list of all generation IDs present at that point in time. This means you can reconstruct the state of the run at any iteration by reading up to a given line.
+
+### Reading the archive in Python
+
+```python
+from utils.gl_utils import load_archive_data
+
+# Read only the final state
+last_entry = load_archive_data("outputs/generate_.../archive.jsonl", last_only=True)
+print(last_entry["archive"])
+# ["initial", 1, 2, 3, 4, ...]
+
+# Read the full time series
+all_entries = load_archive_data("outputs/generate_.../archive.jsonl", last_only=False)
+for entry in all_entries:
+    print(entry["current_genid"], "->", entry["archive"])
+```
+
+---
+
+## Reading scores programmatically
+
+### `get_score` — raw score from `report.json`
+
+```python
+from utils.gl_utils import get_score
+
+score = get_score(domain, output_dir, genid, split="train")
+```
+
+Reads `gen_{genid}/{domain}_eval/report.json` (or `{domain}_eval_{split}/report.json` for non-train splits) and returns the scalar value at the domain's score key. Returns `None` if the file does not exist or the score is `NaN`.
+
+### `get_saved_score` — score with staged-eval adjustment
+
+```python
+from utils.gl_utils import get_saved_score
+
+score = get_saved_score(domain, output_dir, genid, split="train", type="agent")
+```
+
+Wraps `get_score` with two additional behaviours:
+
+1. **Staged-eval scaling.** If `run_full_eval` is `false` for this node (meaning only the staged subset was evaluated), the raw score is multiplied by `get_domain_stagedeval_frac(domain)` so it is comparable to fully-evaluated nodes.
+2. **Score type selection.** The `type` parameter controls which score to return:
+
+| `type` | Returns |
+|---|---|
+| `"agent"` | The task-agent's own score from `report.json`. |
+| `"ensemble"` | The ensemble score from `report_ensemble_{domain}_{split}.json`. |
+| `"max"` | The higher of the agent score and the ensemble score. |
+
+### Iterating over all generations
+
+```python
+from utils.gl_utils import load_archive_data, get_saved_score
+
+output_dir = "outputs/generate_20251216_192315_534288"
+archive = load_archive_data(f"{output_dir}/archive.jsonl", last_only=True)["archive"]
+
+for genid in archive:
+    score = get_saved_score("paper_review", output_dir, genid, split="train", type="agent")
+    print(f"gen_{genid}: {score}")
+```
+
+---
+
+## Reading agent chat histories
+
+The full meta-agent conversation for each generation is saved as Markdown in `gen_{N}/agent_output/meta_agent_chat_history.md`. Open it directly in any Markdown viewer or read it programmatically:
+
+```python
+with open(f"outputs/generate_.../gen_5/agent_output/meta_agent_chat_history.md") as f:
+    chat = f.read()
+```
+
+Per-sample *task-agent* conversations are stored under `gen_{N}/{domain}_eval/agent_evals/`. Each file is named by the task instance ID and contains the conversation the task agent had while solving that specific problem.
+
+---
+
+## How `select_parent` uses archive scores
+
+After each generation, `select_parent` in `utils/gl_utils.py` picks the next parent from the archive. Understanding this process helps interpret which lineage branches are likely to be explored.
+
+```python
+select_parent(archive, output_dir, domains, method="best")
+```
+
+The function first filters out nodes where `valid_parent` is `false`. For the remaining candidates it computes a per-node score by averaging the `get_saved_score(..., type="max")` result across all domains. The preferred split is `"val"` if the domain has a validation subset, otherwise `"train"`.
+
+Available selection methods:
+
+| Method | Behaviour |
+|---|---|
+| `"best"` | Always select the highest-scoring valid node. |
+| `"latest"` | Select the most recently added valid node. Used when `run_baseline="no_archive"`. |
+| `"random"` | Uniform random selection among valid nodes. |
+| `"score_prop"` | Sample proportionally to a sigmoid-transformed score, centred on the mean of the top-3 scores. Encourages exploration while still favouring high-scoring nodes. |
+| `"score_child_prop"` | Like `score_prop`, but each node's probability is further multiplied by an exponential penalty for the number of existing children: `exp(-(children/8)^3)`. This discourages over-exploiting a single promising branch. The default when running via `generate_loop.py --parent_selection` (CLI default). |
+
+When `edit_select_parent=True` is set, the selection logic itself can be modified by the meta-agent; in that case the selection runs inside a Docker container using the agent's own `select_next_parent.py`.
+
+<Tip>
+When analysing a run, check `valid_parent` in `metadata.json` for each node before drawing conclusions from score trends. Nodes with `valid_parent: false` are excluded from parent selection and may represent dead-end branches rather than poor-performing agents.
+</Tip>

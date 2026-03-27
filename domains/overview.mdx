@@ -1,0 +1,139 @@
+---
+title: Domains Overview
+description: All benchmark domains supported by HyperAgents, their scoring metrics, dataset splits, and how to add a new domain.
+---
+
+HyperAgents evaluates agents across seven benchmark domains spanning preference judgment, game playing, robotic control, mathematical reasoning, and multi-language software engineering. Each domain is a self-contained module under `domains/` with a `utils.py` that defines its dataset format and a shared harness that drives evaluation.
+
+## Supported Domains
+
+<CardGroup cols={2}>
+  <Card title="paper_review" icon="file-lines" href="/domains/paper-review">
+    Judges AI-generated academic paper reviews. Predicts accept/reject outcomes against human reviewer decisions.
+  </Card>
+  <Card title="search_arena" icon="magnifying-glass" href="/domains/search-arena">
+    Preference judgment for web-search responses. Picks the better of two model-generated search answers.
+  </Card>
+  <Card title="balrog" icon="gamepad" href="/domains/balrog">
+    Game-playing ability across four NetHack-family environments: `babyai`, `babaisai`, `minihack`, and `nle`.
+  </Card>
+  <Card title="genesis" icon="robot" href="/domains/genesis">
+    Robotic locomotion control for the Unitree Go2 quadruped. Three tasks: walking, walking backward, and hopping.
+  </Card>
+  <Card title="imo_grading" icon="calculator" href="/domains/imo">
+    Grades student answers to International Mathematical Olympiad problems against official rubrics.
+  </Card>
+  <Card title="imo_proof" icon="square-root-variable" href="/domains/imo">
+    Generates full mathematical proofs for IMO problems, then scores them with a proof-grading agent.
+  </Card>
+  <Card title="polyglot" icon="code" href="/domains/polyglot">
+    SWE-bench-style coding tasks across Python, Rust, Go, JavaScript, C++, and Java — each in its own Docker container.
+  </Card>
+</CardGroup>
+
+## Domain Summary Table
+
+| Domain | Score Key | Splits | Eval Subset | Ensemble? |
+|---|---|---|---|---|
+| `paper_review` | `overall_accuracy` | train / val / test | `_filtered_100_train` | Yes |
+| `search_arena` | `overall_accuracy` | train / val / test | `_filtered_100_train` | Yes |
+| `balrog_babyai` | `average_progress` | train | — | No |
+| `balrog_babaisai` | `average_progress` | train | — | No |
+| `balrog_minihack` | `average_progress` | train | — | No |
+| `balrog_nle` | `average_progress` | train | — | No |
+| `genesis_go2walking` | `average_fitness` | train | — | No |
+| `genesis_go2walkback` | `average_fitness` | train | — | No |
+| `genesis_go2hop` | `average_fitness` | train | — | No |
+| `imo_grading` | `overall_accuracy` | train / val / test | `_filtered_100_train` | Yes |
+| `imo_proof` | `points_percentage` | train | — | No |
+| `polyglot` | `accuracy_score` | train | — | No |
+
+## domain_utils.py Reference
+
+All cross-domain logic lives in `utils/domain_utils.py`. The four primary functions are:
+
+### `get_domain_score_key(domain)`
+
+Returns the key to look up in `report.json` for the domain's primary metric.
+
+```python
+get_domain_score_key("paper_review")      # "overall_accuracy"
+get_domain_score_key("balrog_babyai")     # "average_progress"
+get_domain_score_key("genesis_go2walking") # "average_fitness"
+get_domain_score_key("polyglot")          # "accuracy_score"
+get_domain_score_key("imo_proof")         # "points_percentage"
+```
+
+### `get_domain_splits(domain, eval_test=False)`
+
+Returns the list of dataset splits to evaluate on. Human-preference domains (`search_arena`, `paper_review`, `imo_grading`) support `train`, `val`, and optionally `test`. All other domains return only `["train"]`.
+
+```python
+get_domain_splits("paper_review")            # ["train", "val"]
+get_domain_splits("paper_review", eval_test=True)  # ["train", "val", "test"]
+get_domain_splits("balrog_babyai")           # ["train"]
+```
+
+### `get_domain_eval_subset(domain)`
+
+Returns the file suffix for the default evaluation subset. Human-preference domains use `_filtered_100_train` (100 balanced samples). Game, robotic, and proof domains use an empty string (full dataset).
+
+```python
+get_domain_eval_subset("paper_review")  # "_filtered_100_train"
+get_domain_eval_subset("balrog_nle")    # ""
+```
+
+### `can_domain_ensembled(domain)`
+
+Returns `True` if the domain supports ensemble evaluation (i.e., aggregating multiple agent runs). Preference-judgment domains (`search_arena`, `paper_review`, `imo_grading`) support ensembling. Game, robotic, and proof domains do not.
+
+```python
+can_domain_ensembled("paper_review")  # True
+can_domain_ensembled("balrog_babyai") # False
+can_domain_ensembled("imo_proof")     # False
+```
+
+## Adding a New Domain
+
+To add a new domain to HyperAgents:
+
+<Steps>
+  <Step title="Create the domain directory">
+    Create `domains/<your_domain>/` with at minimum a `utils.py` file.
+  </Step>
+  <Step title="Implement utils.py">
+    Define three module-level constants and one function:
+
+    ```python
+    # domains/my_domain/utils.py
+    QUESTION_ID = "id"          # Column name for the question identifier
+    GROUND_TRUTH_KEY = "label"  # Column name for the ground truth label
+    MODEL = "gpt-4o"            # Default model string passed to TaskAgent
+
+    def format_input_dict(row) -> dict:
+        """Convert a dataset row into the dict passed to agent.forward()."""
+        return {
+            "domain": "my_domain",
+            "text": row["text"],
+        }
+    ```
+  </Step>
+  <Step title="Add the domain to harness.py">
+    Add your domain name to the `--domain` choices list in `domains/harness.py`:
+
+    ```python
+    choices=[
+        "search_arena",
+        "paper_review",
+        ...
+        "my_domain",   # add here
+    ]
+    ```
+  </Step>
+  <Step title="Add dataset loading">
+    If your domain uses a CSV dataset, add a branch in the `get_dataset()` function in `domains/harness.py`. If it uses a custom harness (like BALROG or Genesis), implement a `harness_<domain>()` function and dispatch to it in the main block.
+  </Step>
+  <Step title="Implement reporting">
+    Add scoring logic to `utils/domain_utils.py` for the four utility functions: `get_domain_score_key`, `get_domain_splits`, `get_domain_eval_subset`, and `can_domain_ensembled`.
+  </Step>
+</Steps>

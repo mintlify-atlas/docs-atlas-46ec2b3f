@@ -1,0 +1,315 @@
+---
+title: "Evolution Loop"
+description: "Reference for generate_loop() — parameters, parent selection strategies, staged evaluation, archive management, and resume logic."
+---
+
+The evolution loop is the outer control structure that manages the full lifecycle of self-improvement: it initialises the archive, calls `generate()` in a Docker container for each generation, updates scores, selects the next parent, and saves progress checkpoints.
+
+## `generate_loop()` Signature
+
+```python title="generate_loop.py"
+def generate_loop(
+    domains,                         # list[str] — domains to evaluate
+    run_id=None,                     # str | None — unique run ID (auto-generated if None)
+    max_generation=3,                # int — total number of evolution steps
+    eval_samples=-1,                 # int | list[int] — samples per domain (-1 = all)
+    eval_workers=5,                  # int — parallel workers for evaluation
+    eval_subsets=[],                 # list[str] — dataset subset identifiers per domain
+    parent_selection="score_prop",   # str — selection strategy
+    resume_from=None,                # str | None — path to existing output dir to resume
+    output_dir_parent=None,          # str | None — parent dir for output (defaults to ./outputs/)
+    meta_patch_files=None,           # list[str] | None — initial .diff patches to apply
+    reset_task_agent=False,          # bool — strip task_agent changes from meta_patch_files
+    reset_meta_agent=False,          # bool — strip meta_agent changes from meta_patch_files
+    copy_root_dir=None,              # str | None — use a different repo snapshot as root
+    run_baseline=None,               # str | None — baseline mode
+    optimize_option="only_agent",    # str — what to optimize
+    agent_archive_path=None,         # str | None — external archive for ensemble mode
+    eval_test=False,                 # bool — also run test-set evaluation
+    skip_staged_eval=False,          # bool — skip the small-sample pre-filter
+    edit_select_parent=False,        # bool — let the meta-agent edit parent selection code
+)
+```
+
+## A Single `generate()` Call
+
+Each generation is executed inside the `generate()` function, which manages a dedicated Docker container:
+
+<Steps>
+  <Step title="Create and start container">
+    A fresh Docker container is built from the `HyperAgents` image. The image contains the full repo and all domain dependencies.
+
+    ```python
+    container = build_container(docker_client, root_dir, image_name, container_name, domains=domains)
+    container.start()
+    ```
+  </Step>
+  <Step title="Apply parent lineage patches">
+    All `.diff` files from the selected parent's lineage (accumulated across ancestors) are applied via `patch -p1` inside the container. This reconstructs the parent agent's exact codebase state.
+
+    ```python
+    patch_files = get_patch_files(output_dir, parent_genid)  # prev + curr patches
+    commit_hash = apply_diffs_container(container, patch_files)
+    ```
+  </Step>
+  <Step title="Run the meta-agent (6h timeout)">
+    `run_meta_agent.py` is executed inside the container. It invokes `MetaAgent.forward()`, captures git diff, and saves `model_patch.diff`:
+
+    ```python
+    command = [
+        "timeout", "21600",   # 6 hours
+        "python", "run_meta_agent.py",
+        "--repo_path",      f"/{REPO_NAME}/",
+        "--evals_folder",   container_prev_eval_path,
+        "--git_dir",        f"/{REPO_NAME}",
+        "--base_commit",    commit_hash,
+        "--outdir",         container_agentoutput_folder,
+        "--iterations_left", str(max_generation - current_genid),
+    ]
+    ```
+  </Step>
+  <Step title="Compilation check">
+    Before running evaluation, the loop imports both `MetaAgent` and `TaskAgent` inside the container. If either fails to import, evaluation is skipped and `run_eval` is set to `False` in metadata.
+  </Step>
+  <Step title="Staged evaluation">
+    Unless `--skip_staged_eval` is set, the agent is evaluated on a small subset first. If the score is `None` or `<= 0`, the generation is pruned and full evaluation does not run. See [Staged Evaluation](#staged-evaluation) below.
+  </Step>
+  <Step title="Full evaluation (5h timeout per domain)">
+    If staged evaluation passes (or is skipped), `domains/harness.py` runs `TaskAgent` across the full dataset. Results are saved to `gen_<id>/<domain>_eval/report.json`.
+  </Step>
+  <Step title="Cleanup">
+    The container runs `git reset --hard <root_commit>` and `git clean -fd` to restore a pristine state, then is stopped and removed. Outputs have already been copied to the host by this point.
+  </Step>
+  <Step title="Save metadata">
+    `metadata.json` is written to `gen_<id>/` with patch file paths, eval flags, and `valid_parent` status:
+
+    ```python
+    metadata["valid_parent"] = metadata["run_eval"] and (
+        eval_successful or meta_patch_files is not None
+    )
+    ```
+  </Step>
+</Steps>
+
+## Staged Evaluation
+
+Staged evaluation is a two-phase filter that avoids spending compute on agents that produce no improvement.
+
+**Phase 1 — small subset:**
+Each domain defines a small evaluation subset via `get_domain_stagedeval_samples(domain)`. The agent is evaluated on this small set first.
+
+**Threshold:**
+```python
+run_next_eval = all([x is not None and x > 0 for x in stagedeval_scores])
+```
+
+If any domain score is `None` or exactly `0`, the generation is dropped and full evaluation is not run. The metadata records `run_full_eval: False`.
+
+**Phase 2 — full dataset:**
+If the threshold is passed, evaluation runs on the complete dataset.
+
+**Score adjustment:**
+For nodes that only completed staged evaluation, `get_saved_score()` scales the score by `stagedeval_frac` (a domain-specific fraction) to make it comparable to scores from full evaluation when selecting parents:
+
+```python title="utils/gl_utils.py (get_saved_score)"
+run_full_eval = get_node_metadata_key(output_dir, genid, "run_full_eval")
+if genid == "initial" or (run_full_eval is None or not run_full_eval):
+    stagedeval_frac = get_domain_stagedeval_frac(domain)
+    agent_score = agent_score * stagedeval_frac if agent_score is not None else None
+```
+
+<Tip>
+Disable staged evaluation with `--skip_staged_eval` when debugging or when the domain has a very small dataset where the staged subset provides no useful signal.
+</Tip>
+
+## Parent Selection Strategies
+
+`select_parent()` in `utils/gl_utils.py` reads the archive and picks the next parent. The method is set via `--parent_selection`.
+
+<Accordion title="random">
+  Selects uniformly at random from all valid candidates that have evaluation scores.
+
+  ```python
+  return random.choice(list(candidates.keys()))
+  ```
+
+  Good for: exploration experiments, ablation studies.
+</Accordion>
+
+<Accordion title="latest">
+  Always selects the most recently added valid node. Equivalent to a linear chain — no branching.
+
+  ```python
+  return list(candidates.keys())[-1]
+  ```
+
+  <Note>This is the forced strategy when `--run_baseline=no_archive` is set.</Note>
+</Accordion>
+
+<Accordion title="best">
+  Greedy selection: picks the single highest-scoring node.
+
+  ```python
+  return max(candidates, key=candidates.get)
+  ```
+
+  Risk: premature convergence — all future generations branch from the same node.
+</Accordion>
+
+<Accordion title="score_prop">
+  Probabilistic selection proportional to a sigmoid of the score:
+
+  ```python
+  mid_point = np.mean(sorted(scores, reverse=True)[:3])  # mean of top-3
+  scores = [1 / (1 + math.exp(-10 * (score - mid_point))) for score in scores]
+  # normalise to probability distribution
+  return random.choices(commits, weights=probabilities)[0]
+  ```
+
+  Higher-scoring nodes are more likely to be selected but lower-scoring nodes still have a chance.
+</Accordion>
+
+<Accordion title="score_child_prop (default)">
+  Same as `score_prop` but penalises nodes that already have many children:
+
+  ```python
+  penalties = [math.exp(-(child_counts[commit]/8)**3) for commit in commits]
+  combined = [s * p for s, p in zip(scores, penalties)]
+  ```
+
+  The penalty is cubic-exponential: a node with 8 children has its probability multiplied by ~0.37; a node with 16 children by ~0.006. This encourages the tree to stay broad and explore diverse lineages.
+
+  This is the default because it balances exploitation (high-scoring nodes) with exploration (underexplored branches).
+</Accordion>
+
+## Archive Management
+
+### `update_and_save_archive()`
+
+Called after every `generate()` call:
+
+```python title="utils/gl_utils.py (update_and_save_archive)"
+def update_and_save_archive(output_dir, archive, new_node):
+    archive.append(new_node)
+    archive_file = os.path.join(output_dir, "archive.jsonl")
+    with open(archive_file, "a") as f:
+        f.write(
+            json.dumps({"current_genid": new_node, "archive": archive})
+            + "\n"
+        )
+    return archive
+```
+
+The file is append-only. Each line is a full snapshot of the archive at that point in time.
+
+### `archive.jsonl` Format
+
+```jsonl title="outputs/generate_<run_id>/archive.jsonl"
+{"current_genid": "initial", "archive": ["initial"]}
+{"current_genid": 1, "archive": ["initial", 1]}
+{"current_genid": 2, "archive": ["initial", 1, 2]}
+{"current_genid": 3, "archive": ["initial", 1, 2, 3]}
+```
+
+`load_archive_data(filepath, last_only=True)` reads the last line to get the current archive state.
+
+### `get_score()` — Reading a Generation's Score
+
+```python title="utils/gl_utils.py (get_score)"
+def get_score(domain, output_dir, genid, split="train"):
+    eval_file = os.path.join(output_dir, f"gen_{genid}/{domain}_eval/report.json")
+    score_key = get_domain_score_key(domain)
+    with open(eval_file) as f:
+        eval_results = json.load(f)
+    return eval_results[score_key]  # None if file missing or NaN
+```
+
+Each domain registers its own score key in `utils/domain_utils.py`.
+
+## Resuming a Previous Run
+
+Pass `--resume_from <output_dir>` to continue an interrupted run:
+
+```python title="generate_loop.py (resume)"
+if resume_from:
+    output_dir = os.path.normpath(os.path.abspath(resume_from))
+    run_id = os.path.basename(output_dir).split("generate_")[-1]
+    root_dir, root_commit = setup_initial_gen(
+        output_dir, domains, ..., resume=True, ...
+    )
+    archive = load_archive_data(
+        os.path.join(output_dir, "archive.jsonl"), last_only=True
+    )["archive"]
+```
+
+The loop reads the archive to determine how many generations have already run (`start_genid = len(archive)`) and picks up the parent selection from there. The snapshotted repo in `gen_initial/<REPO_NAME>/` is reused as `root_dir`.
+
+## Command Examples
+
+<Tabs>
+  <Tab title="Basic run">
+    ```bash
+    python generate_loop.py \
+      --domains search_arena \
+      --max_generation 20 \
+      --parent_selection score_child_prop
+    ```
+  </Tab>
+  <Tab title="Multiple domains">
+    ```bash
+    python generate_loop.py \
+      --domains search_arena paper_review \
+      --max_generation 15 \
+      --eval_samples 50 50 \
+      --eval_workers 10 \
+      --parent_selection score_prop
+    ```
+  </Tab>
+  <Tab title="Skip staged eval">
+    ```bash
+    python generate_loop.py \
+      --domains imo_grading \
+      --max_generation 10 \
+      --skip_staged_eval
+    ```
+  </Tab>
+  <Tab title="Resume">
+    ```bash
+    python generate_loop.py \
+      --domains search_arena \
+      --max_generation 30 \
+      --resume_from ./outputs/generate_20250101_120000_000000
+    ```
+  </Tab>
+  <Tab title="Start from a patch">
+    ```bash
+    # Apply an existing diff as generation 0, then evolve from there
+    python generate_loop.py \
+      --domains paper_review \
+      --max_generation 10 \
+      --meta_patch_files ./my_baseline.diff
+    ```
+  </Tab>
+</Tabs>
+
+## Supported Domains
+
+```
+search_arena      paper_review      imo_grading       imo_proof
+balrog_babyai     balrog_babaisai   balrog_minihack   balrog_nle
+genesis_go2walking  genesis_go2walkback  genesis_go2hop
+polyglot          (separate harness)
+```
+
+<Warning>
+The `polyglot` domain uses a separate evaluation harness (`domains/polyglot/harness.py`) with two staged subsets (`small.json` → `medium.json`) and a threshold of `0.4`. It is evaluated after the main harness loop in `run_harness_polyglot()`.
+</Warning>
+
+<CardGroup cols={2}>
+  <Card title="Meta-Agent" icon="robot" href="/concepts/meta-agent">
+    What runs inside each generate() call.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    High-level system overview and Docker sandbox details.
+  </Card>
+</CardGroup>
